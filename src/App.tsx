@@ -15,6 +15,7 @@ import type {
   PercussionTrack,
   SampleCandidate,
   StudioPage,
+  TapLoopSettings,
   TapPad,
   TapPresetOption,
 } from './types/sequencer';
@@ -25,16 +26,20 @@ import {
   hydrateTracksWithFallbackSamples,
 } from './utils/sequencerLogic';
 import {
-  computeTapPhase,
+  clampUnit,
   createDefaultTapPads,
+  createEmptySteps,
   createNextTapPad,
+  DEFAULT_TAP_LOOP_SETTINGS,
   estimateBpmFromTapIntervals,
-  phaseToBarBeatStep,
+  humanizeSteps,
 } from './utils/tapLoopLogic';
+import { mixAudioBufferToMonoSegment } from './utils/audioUploadHelper';
 
 function extractWaveformPeaks(buffer: AudioBuffer, binCount = 96): number[] {
   const channel = buffer.getChannelData(0);
   const blockSize = Math.max(1, Math.floor(channel.length / binCount));
+  const step = Math.max(4, Math.floor(blockSize / 64));
   const peaks: number[] = [];
   let maxPeak = 0.001;
 
@@ -42,7 +47,7 @@ function extractWaveformPeaks(buffer: AudioBuffer, binCount = 96): number[] {
     const start = i * blockSize;
     const end = Math.min(channel.length, start + blockSize);
     let peak = 0;
-    for (let j = start; j < end; j += 4) {
+    for (let j = start; j < end; j += step) {
       const abs = Math.abs(channel[j]);
       if (abs > peak) peak = abs;
     }
@@ -51,17 +56,6 @@ function extractWaveformPeaks(buffer: AudioBuffer, binCount = 96): number[] {
   }
 
   return peaks.map((p) => p / maxPeak);
-}
-
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  const chunkSize = 0x8000;
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const slice = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode(...slice);
-  }
-  return btoa(binary);
 }
 
 function inferAudioMimeType(file: File): string {
@@ -134,9 +128,10 @@ export default function App() {
   // Tap Loop studio state
   const [tapPads, setTapPads] = useState<TapPad[]>(() => createDefaultTapPads());
   const [tapRecordArmed, setTapRecordArmed] = useState(true);
-  const [tapQuantize, setTapQuantize] = useState(false);
   const [tapClickEnabled, setTapClickEnabled] = useState(false);
-  const [tapPhase, setTapPhase] = useState(-1);
+  const [tapSettings, setTapSettings] = useState<TapLoopSettings>(() => ({
+    ...DEFAULT_TAP_LOOP_SETTINGS,
+  }));
   const [tapPadError, setTapPadError] = useState<string | null>(null);
   const [flashingPadIds, setFlashingPadIds] = useState<Record<string, number>>({});
   const tapTempoHistoryRef = useRef<number[]>([]);
@@ -157,8 +152,9 @@ export default function App() {
       mode,
       tapPads,
       tapClickEnabled,
+      tapSettings,
     });
-  }, [activePage, tapPads, tapClickEnabled]);
+  }, [activePage, tapPads, tapClickEnabled, tapSettings]);
 
   useEffect(() => {
     if (activePage === 'taploop') {
@@ -184,9 +180,6 @@ export default function App() {
     if (!engine) return;
     engine.setOnStep((step) => {
       setCurrentStep(step);
-    });
-    engine.setOnTapPhase((phase) => {
-      setTapPhase(phase);
     });
     engine.setOnTapPadTrigger((padId) => {
       triggerPadFlash(padId);
@@ -255,7 +248,6 @@ export default function App() {
       engine.stop();
       setIsPlaying(false);
       setCurrentStep(-1);
-      setTapPhase(-1);
     } else {
       setIsPlaying(true);
       await engine.start();
@@ -270,7 +262,6 @@ export default function App() {
         engineRef.current?.stop();
         setIsPlaying(false);
         setCurrentStep(-1);
-        setTapPhase(-1);
       }
       setActivePage(nextPage);
     },
@@ -286,39 +277,34 @@ export default function App() {
       triggerPadFlash(padId);
       setTapPadError(null);
 
-      const { tapCtxTime, wasPlaying, elapsedInCycle, loopDuration } =
-        await engine.triggerTapPadNow(pad, 96);
+      const { stepIndex, wasPlaying, tapCtxTime } = await engine.triggerTapPadNow(
+        pad,
+        94
+      );
 
       if (!tapRecordArmed) return;
 
-      const phase = wasPlaying
-        ? computeTapPhase(elapsedInCycle, loopDuration, tapQuantize, loopBars)
-        : 0;
-
-      const newEvent = {
-        id: `tap-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        phase,
-        velocity: 96,
-        skipUntilCtxTime: tapCtxTime + Math.min(0.28, loopDuration * 0.4),
-      };
-
-      const nextPads = tapPads.map((p) =>
-        p.id === padId ? { ...p, events: [...p.events, newEvent] } : p
-      );
+      const nextPads = tapPads.map((p) => {
+        if (p.id !== padId) return p;
+        const nextSteps = [...p.steps];
+        nextSteps[stepIndex] = 94;
+        return { ...p, steps: nextSteps };
+      });
 
       setTapPads(nextPads);
       engine.updateTapLoopState({
         mode: 'taploop',
         tapPads: nextPads,
         tapClickEnabled,
+        tapSettings,
       });
 
       if (!wasPlaying) {
         setIsPlaying(true);
-        await engine.startTapLoopFromTap(tapCtxTime);
+        await engine.startTapLoopFromFirstTap(tapCtxTime);
       }
     },
-    [tapPads, tapRecordArmed, tapQuantize, loopBars, tapClickEnabled, triggerPadFlash]
+    [tapPads, tapRecordArmed, tapClickEnabled, tapSettings, triggerPadFlash]
   );
 
   const handleAddTapPad = () => {
@@ -382,14 +368,64 @@ export default function App() {
     );
   };
 
-  const handleClearTapPadEvents = (padId: string) => {
+  const handleClearTapPadSteps = (padId: string) => {
     setTapPads((prev) =>
-      prev.map((p) => (p.id === padId ? { ...p, events: [] } : p))
+      prev.map((p) => (p.id === padId ? { ...p, steps: createEmptySteps() } : p))
     );
   };
 
   const handleClearAllTapLoops = () => {
-    setTapPads((prev) => prev.map((p) => ({ ...p, events: [] })));
+    setTapPads((prev) => prev.map((p) => ({ ...p, steps: createEmptySteps() })));
+  };
+
+  const handleTapPadReverbChange = (padId: string, reverb: number) => {
+    const safeRev = clampUnit(reverb);
+    setTapPads((prev) =>
+      prev.map((p) => (p.id === padId ? { ...p, reverb: safeRev } : p))
+    );
+  };
+
+  const handleToggleTapStep = (padId: string, stepIndex: number) => {
+    setTapPads((prev) =>
+      prev.map((p) => {
+        if (p.id !== padId) return p;
+        const nextSteps = [...p.steps];
+        nextSteps[stepIndex] = (nextSteps[stepIndex] ?? 0) > 0 ? 0 : 88;
+        return { ...p, steps: nextSteps };
+      })
+    );
+  };
+
+  const handleSetTapStepVelocity = (
+    padId: string,
+    stepIndex: number,
+    velocity: number
+  ) => {
+    const safeVel = velocity <= 0 ? 0 : Math.min(100, Math.max(15, Math.round(velocity)));
+    setTapPads((prev) =>
+      prev.map((p) => {
+        if (p.id !== padId) return p;
+        const nextSteps = [...p.steps];
+        nextSteps[stepIndex] = safeVel;
+        return { ...p, steps: nextSteps };
+      })
+    );
+  };
+
+  const handleHumanizePad = (padId: string) => {
+    setTapPads((prev) =>
+      prev.map((p) => (p.id === padId ? { ...p, steps: humanizeSteps(p.steps) } : p))
+    );
+  };
+
+  const handleHumanizeAllPads = () => {
+    setTapPads((prev) =>
+      prev.map((p) => ({ ...p, steps: humanizeSteps(p.steps) }))
+    );
+  };
+
+  const handleUpdateTapSettings = (patch: Partial<TapLoopSettings>) => {
+    setTapSettings((prev) => ({ ...prev, ...patch }));
   };
 
   const handleTapTempo = () => {
@@ -473,20 +509,42 @@ export default function App() {
     setAnalysisStatus('analyzing');
     setAnalysisError(null);
 
-    try {
-      const buffer = await uploadedFile.arrayBuffer();
-      const audioBase64 = arrayBufferToBase64(buffer);
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 65_000);
 
-      const res = await fetch('/api/analyze-audio', {
+    try {
+      // Yield a paint frame so the spinner renders smoothly before work begins
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+
+      const decoded = engineRef.current?.getOriginalBuffer() ?? null;
+      let uploadBody: Blob = uploadedFile;
+      let uploadMime = inferAudioMimeType(uploadedFile);
+
+      // For large/long songs already decoded, extract a compact 20s 16kHz groove clip (~640 KB)
+      // so upload + Gemini transcription finishes fast without memory spikes or tab freezes.
+      if (decoded && (uploadedFile.size > 1_800_000 || decoded.duration > 24)) {
+        const startSec =
+          decoded.duration > 30 ? Math.min(15, decoded.duration * 0.2) : 0;
+        const compactWav = mixAudioBufferToMonoSegment(decoded, startSec, 20);
+        uploadBody = new Blob([compactWav], { type: 'audio/wav' });
+        uploadMime = 'audio/wav';
+      }
+
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/octet-stream',
+        'x-audio-mime': uploadMime,
+        'x-file-name': encodeURIComponent(uploadedFile.name),
+        'x-analysis-mode': mode,
+      };
+      if (mode === 'compose' && targetGroove) {
+        headers['x-target-groove'] = targetGroove;
+      }
+
+      const res = await fetch('/api/analyze-audio-raw', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          audioBase64,
-          mimeType: inferAudioMimeType(uploadedFile),
-          fileName: uploadedFile.name,
-          analysisMode: mode,
-          targetGroove: mode === 'compose' ? targetGroove : undefined,
-        }),
+        headers,
+        body: uploadBody,
+        signal: controller.signal,
       });
 
       const payload = (await res.json()) as ArrangementBlueprint & { error?: string };
@@ -515,9 +573,17 @@ export default function App() {
       }
     } catch (err) {
       setAnalysisStatus('error');
-      setAnalysisError(
-        err instanceof Error ? err.message : 'Unable to analyze audio with Gemini.'
-      );
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setAnalysisError(
+          'Analysis timed out. Please try a shorter 15-30 second clip or smaller MP3.'
+        );
+      } else {
+        setAnalysisError(
+          err instanceof Error ? err.message : 'Unable to analyze audio with Gemini.'
+        );
+      }
+    } finally {
+      window.clearTimeout(timeoutId);
     }
   };
 
@@ -628,6 +694,7 @@ export default function App() {
         tracks,
         blendRatio,
         tapPads,
+        tapSettings,
         exportTapLoop: isTapExport,
       });
       const url = URL.createObjectURL(wavBlob);
@@ -711,14 +778,20 @@ export default function App() {
             bpm={bpm}
             loopBars={loopBars}
             isPlaying={isPlaying}
-            tapPhase={tapPhase}
+            currentStep={currentStep}
+            activeBar={activeBar}
+            followPlayhead={followPlayhead}
             recordArmed={tapRecordArmed}
-            quantize={tapQuantize}
             clickEnabled={tapClickEnabled}
+            tapSettings={tapSettings}
             flashingPadIds={flashingPadIds}
             padError={tapPadError}
+            onSelectBar={(bar) => {
+              setFollowPlayhead(false);
+              setActiveBar(bar);
+            }}
+            onToggleFollowPlayhead={() => setFollowPlayhead((f) => !f)}
             onToggleRecordArmed={() => setTapRecordArmed((v) => !v)}
-            onToggleQuantize={() => setTapQuantize((v) => !v)}
             onToggleClick={() => setTapClickEnabled((v) => !v)}
             onTapTempo={handleTapTempo}
             onPadTap={(padId) => void handlePadTap(padId)}
@@ -727,8 +800,14 @@ export default function App() {
             onSelectPreset={handleSelectTapPreset}
             onReplacePadFile={(padId, file) => void handleReplaceTapPadFile(padId, file)}
             onTogglePadMute={handleToggleTapPadMute}
-            onClearPadEvents={handleClearTapPadEvents}
+            onClearPadSteps={handleClearTapPadSteps}
             onClearAllPads={handleClearAllTapLoops}
+            onPadReverbChange={handleTapPadReverbChange}
+            onTogglePadStep={handleToggleTapStep}
+            onSetPadStepVelocity={handleSetTapStepVelocity}
+            onHumanizePad={handleHumanizePad}
+            onHumanizeAll={handleHumanizeAllPads}
+            onUpdateTapSettings={handleUpdateTapSettings}
           />
         )}
 
@@ -764,13 +843,6 @@ export default function App() {
         isPlaying={isPlaying}
         onTogglePlay={() => void handleTogglePlay()}
         currentStep={currentStep}
-        customStepDisplay={
-          activePage === 'taploop'
-            ? tapPhase >= 0
-              ? phaseToBarBeatStep(tapPhase, loopBars)
-              : '01.1.1'
-            : null
-        }
         loopBars={loopBars}
         onLoopBarsChange={(bars) => {
           setLoopBars(bars);

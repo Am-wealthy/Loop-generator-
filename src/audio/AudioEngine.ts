@@ -1,7 +1,9 @@
 import type {
   LoopBars,
   PercussionTrack,
+  ReverbRoomSize,
   SampleCandidate,
+  TapLoopSettings,
   TapPad,
 } from '../types/sequencer';
 import {
@@ -13,9 +15,12 @@ import {
   isTrackAudible,
 } from '../utils/sequencerLogic';
 import {
-  getLoopDurationSeconds,
-  getPhaseEventsInWindow,
-  normalizePhase,
+  clampCutoffHz,
+  clampResonanceQ,
+  clampUnit,
+  DEFAULT_TAP_LOOP_SETTINGS,
+  getReverbDecaySeconds,
+  snapStepFromTiming,
 } from '../utils/tapLoopLogic';
 
 const LOOKAHEAD_MS = 22; // Tight low-latency scheduler interval
@@ -25,6 +30,15 @@ export class StudioAudioEngine {
   private ctx: AudioContext | null = null;
   private percussionBus: GainNode | null = null;
   private originalBus: GainNode | null = null;
+
+  // Tap Loop FX graph:
+  // Dry Pad -> tapMasterFilter -> percussionBus
+  // Pad Reverb Send -> tapReverbConvolver -> tapReverbReturn -> tapMasterFilter
+  private tapMasterFilter: BiquadFilterNode | null = null;
+  private tapReverbConvolver: ConvolverNode | null = null;
+  private tapReverbReturn: GainNode | null = null;
+  private currentReverbSize: ReverbRoomSize = 'hall';
+
   private sampleCache = new Map<string, AudioBuffer>();
   private pendingLoads = new Map<string, Promise<AudioBuffer>>();
 
@@ -41,8 +55,8 @@ export class StudioAudioEngine {
   private engineMode: 'sequencer' | 'taploop' = 'sequencer';
   private tapPads: TapPad[] = [];
   private tapClickEnabled = false;
-  private tapCycleStartTime = 0;
-  private tapWindowCursor = 0;
+  private tapSettings: TapLoopSettings = { ...DEFAULT_TAP_LOOP_SETTINGS };
+  private skipOnceMap = new Map<string, { stepIndex: number; untilTime: number }>();
   private customTapBuffers = new Map<string, AudioBuffer>();
 
   private bpm = 126;
@@ -51,8 +65,31 @@ export class StudioAudioEngine {
   private tracks: PercussionTrack[] = [];
 
   private onStepCallback: ((step: number) => void) | null = null;
-  private onTapPhaseCallback: ((phase: number) => void) | null = null;
   private onTapPadTriggerCallback: ((padId: string) => void) | null = null;
+
+  private buildReverbImpulse(
+    ctx: BaseAudioContext,
+    decaySeconds: number
+  ): AudioBuffer {
+    const sr = ctx.sampleRate;
+    const length = Math.max(1, Math.floor(sr * decaySeconds));
+    const impulse = ctx.createBuffer(2, length, sr);
+
+    for (let ch = 0; ch < 2; ch++) {
+      const data = impulse.getChannelData(ch);
+      let lp = 0;
+      for (let i = 0; i < length; i++) {
+        const t = i / length;
+        // Early pre-delay smoothness + exponential natural hall tail
+        const env = Math.pow(1 - t, 2.6) * (i < sr * 0.01 ? i / (sr * 0.01) : 1);
+        const white = Math.random() * 2 - 1;
+        // Gentle low-pass damping inside impulse so tail sounds warm, never harsh
+        lp = lp * 0.42 + white * 0.58;
+        data[i] = lp * env * 0.65;
+      }
+    }
+    return impulse;
+  }
 
   private ensureContext(): AudioContext {
     if (!this.ctx) {
@@ -67,7 +104,27 @@ export class StudioAudioEngine {
       this.originalBus = this.ctx.createGain();
       this.percussionBus.connect(this.ctx.destination);
       this.originalBus.connect(this.ctx.destination);
+
+      this.tapMasterFilter = this.ctx.createBiquadFilter();
+      this.tapMasterFilter.type = 'lowpass';
+      this.tapMasterFilter.frequency.value = this.tapSettings.cutoffHz;
+      this.tapMasterFilter.Q.value = this.tapSettings.resonanceQ;
+      this.tapMasterFilter.connect(this.percussionBus);
+
+      this.tapReverbConvolver = this.ctx.createConvolver();
+      this.currentReverbSize = this.tapSettings.reverbSize;
+      this.tapReverbConvolver.buffer = this.buildReverbImpulse(
+        this.ctx,
+        getReverbDecaySeconds(this.currentReverbSize)
+      );
+
+      this.tapReverbReturn = this.ctx.createGain();
+      this.tapReverbReturn.gain.value = this.tapSettings.masterReverb * 1.25;
+      this.tapReverbConvolver.connect(this.tapReverbReturn);
+      this.tapReverbReturn.connect(this.tapMasterFilter);
+
       this.applyBlend();
+      this.applyTapSettingsToAudioNodes();
     }
     return this.ctx;
   }
@@ -79,16 +136,8 @@ export class StudioAudioEngine {
     }
   }
 
-  public getAudioTime(): number {
-    return this.ensureContext().currentTime;
-  }
-
   public setOnStep(cb: (step: number) => void): void {
     this.onStepCallback = cb;
-  }
-
-  public setOnTapPhase(cb: (phase: number) => void): void {
-    this.onTapPhaseCallback = cb;
   }
 
   public setOnTapPadTrigger(cb: (padId: string) => void): void {
@@ -112,14 +161,53 @@ export class StudioAudioEngine {
     mode: 'sequencer' | 'taploop';
     tapPads: TapPad[];
     tapClickEnabled: boolean;
+    tapSettings?: TapLoopSettings;
   }): void {
     this.engineMode = params.mode;
     this.tapPads = params.tapPads;
     this.tapClickEnabled = params.tapClickEnabled;
+    if (params.tapSettings) {
+      this.tapSettings = {
+        cutoffHz: clampCutoffHz(params.tapSettings.cutoffHz),
+        resonanceQ: clampResonanceQ(params.tapSettings.resonanceQ),
+        masterReverb: clampUnit(params.tapSettings.masterReverb),
+        reverbSize: params.tapSettings.reverbSize,
+      };
+    }
+    this.applyTapSettingsToAudioNodes();
+  }
+
+  private applyTapSettingsToAudioNodes(): void {
+    if (!this.ctx || !this.tapMasterFilter || !this.tapReverbReturn) return;
+    const now = this.ctx.currentTime;
+    const targetCutoff =
+      this.engineMode === 'taploop' ? this.tapSettings.cutoffHz : 20000;
+    const targetQ =
+      this.engineMode === 'taploop' ? this.tapSettings.resonanceQ : 0.7;
+
+    this.tapMasterFilter.frequency.setTargetAtTime(targetCutoff, now, 0.018);
+    this.tapMasterFilter.Q.setTargetAtTime(targetQ, now, 0.018);
+    this.tapReverbReturn.gain.setTargetAtTime(
+      this.tapSettings.masterReverb * 1.25,
+      now,
+      0.02
+    );
+
+    if (
+      this.tapReverbConvolver &&
+      this.tapSettings.reverbSize !== this.currentReverbSize
+    ) {
+      this.currentReverbSize = this.tapSettings.reverbSize;
+      this.tapReverbConvolver.buffer = this.buildReverbImpulse(
+        this.ctx,
+        getReverbDecaySeconds(this.currentReverbSize)
+      );
+    }
   }
 
   private applyBlend(): void {
-    const percGain = this.blendRatio <= 0.5 ? 1 : Math.max(0.2, 1 - (this.blendRatio - 0.5) * 1.6);
+    const percGain =
+      this.blendRatio <= 0.5 ? 1 : Math.max(0.2, 1 - (this.blendRatio - 0.5) * 1.6);
     const hasOrig = Boolean(this.originalBuffer || this.fallbackAudioEl);
     const origGain = hasOrig ? Math.min(1, this.blendRatio * 1.35) : 0;
 
@@ -130,13 +218,16 @@ export class StudioAudioEngine {
     if (!this.ctx || !this.percussionBus || !this.originalBus) return;
     const now = this.ctx.currentTime;
     this.percussionBus.gain.setTargetAtTime(percGain, now, 0.015);
-    this.originalBus.gain.setTargetAtTime(this.originalBuffer ? origGain : 0, now, 0.015);
+    this.originalBus.gain.setTargetAtTime(
+      this.originalBuffer ? origGain : 0,
+      now,
+      0.015
+    );
   }
 
   private stripId3v2IfPresent(arrayBuffer: ArrayBuffer): ArrayBuffer | null {
     if (arrayBuffer.byteLength < 10) return null;
     const bytes = new Uint8Array(arrayBuffer);
-    // "ID3" magic header
     if (bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33) return null;
     const flags = bytes[5];
     const hasFooter = (flags & 0x10) !== 0;
@@ -159,20 +250,18 @@ export class StudioAudioEngine {
       try {
         await ctx.resume();
       } catch {
-        // Autoplay policy may defer resume until user gesture; decodeAudioData can still run
+        // Autoplay policy may defer resume until user gesture
       }
     }
 
     const arrayBuffer = await file.arrayBuffer();
 
-    // 1. Try direct Web Audio decodeAudioData
     try {
       const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
       this.originalBuffer = decoded;
       this.applyBlend();
       return { buffer: decoded, playableViaElement: false };
     } catch {
-      // 2. Retry after stripping ID3v2 artwork/metadata headers on MP3 files
       const stripped = this.stripId3v2IfPresent(arrayBuffer);
       if (stripped) {
         try {
@@ -186,7 +275,6 @@ export class StudioAudioEngine {
       }
     }
 
-    // 3. Fallback to HTMLAudioElement (supports streaming MP3, AAC, M4A, Opus, etc.)
     const objectUrl = URL.createObjectURL(file);
     const audioEl = new Audio(objectUrl);
     audioEl.loop = true;
@@ -224,14 +312,6 @@ export class StudioAudioEngine {
     return { buffer: null, playableViaElement: false };
   }
 
-  public async decodeUploadedAudio(arrayBuffer: ArrayBuffer): Promise<AudioBuffer> {
-    const ctx = this.ensureContext();
-    const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
-    this.originalBuffer = decoded;
-    this.applyBlend();
-    return decoded;
-  }
-
   public clearUploadedAudio(): void {
     this.stopOriginalSource();
     this.originalBuffer = null;
@@ -251,8 +331,8 @@ export class StudioAudioEngine {
     return this.originalBuffer !== null || this.fallbackAudioEl !== null;
   }
 
-  public getOriginalDuration(): number {
-    return this.originalBuffer?.duration ?? 0;
+  public getOriginalBuffer(): AudioBuffer | null {
+    return this.originalBuffer;
   }
 
   public async preloadTracks(tracks: PercussionTrack[]): Promise<void> {
@@ -274,14 +354,24 @@ export class StudioAudioEngine {
 
   public async preloadTapPads(pads: TapPad[]): Promise<void> {
     const ctx = this.ensureContext();
-    await Promise.all(
-      pads.map((pad) =>
+    await Promise.all([
+      ...pads.map((pad) =>
         this.loadSampleBuffer(ctx, pad.sample, pad.id).then(
           () => undefined,
           () => undefined
         )
-      )
-    );
+      ),
+      this.loadSampleBuffer(
+        ctx,
+        { id: 'synth-click-hi', name: 'Click Hi', url: 'synth://click_hi', source: 'synth' },
+        'click_hi'
+      ),
+      this.loadSampleBuffer(
+        ctx,
+        { id: 'synth-click-lo', name: 'Click Lo', url: 'synth://click_lo', source: 'synth' },
+        'click_lo'
+      ),
+    ]);
   }
 
   private trimLeadingSilence(ctx: BaseAudioContext, buffer: AudioBuffer): AudioBuffer {
@@ -399,7 +489,6 @@ export class StudioAudioEngine {
         this.sampleCache.set(cacheKey, decoded);
         return decoded;
       } catch {
-        // Fallback acoustic synthesis if offline/CDN blocked
         const fallback = this.createClickOrPercSynthBuffer(targetCtx, instrumentId);
         this.sampleCache.set(cacheKey, fallback);
         return fallback;
@@ -440,7 +529,7 @@ export class StudioAudioEngine {
       const length = Math.floor(sr * duration);
       const buffer = ctx.createBuffer(1, length, sr);
       const ch = buffer.getChannelData(0);
-      const fund = id.includes('deep_bass') ? 55 : 73.42; // A1 or D2 warm praise bass
+      const fund = id.includes('deep_bass') ? 55 : 73.42;
       for (let i = 0; i < length; i++) {
         const t = i / sr;
         const attack = Math.min(1, t / 0.006);
@@ -467,7 +556,6 @@ export class StudioAudioEngine {
       return buffer;
     }
 
-    // Short organic woody/membrane transient fallback
     const length = Math.floor(sr * 0.18);
     const buffer = ctx.createBuffer(1, length, sr);
     const ch = buffer.getChannelData(0);
@@ -503,51 +591,89 @@ export class StudioAudioEngine {
     this.triggerBufferAt(ctx, this.percussionBus, buffer, track, 95, ctx.currentTime + 0.005);
   }
 
-  public async triggerTapPadNow(pad: TapPad, velocity = 96): Promise<{
-    tapCtxTime: number;
+  /**
+   * Triggers a Tap Pad immediately with zero latency through the Tap Loop filter & reverb graph
+   * and returns the exact tempo-snapped stepIndex (0..stepCount-1).
+   */
+  public async triggerTapPadNow(
+    pad: TapPad,
+    velocity = 94
+  ): Promise<{
+    stepIndex: number;
     wasPlaying: boolean;
-    elapsedInCycle: number;
-    loopDuration: number;
+    tapCtxTime: number;
   }> {
     await this.resume();
     const ctx = this.ensureContext();
     const now = ctx.currentTime;
-    const loopDuration = getLoopDurationSeconds(this.bpm, this.loopBars);
+    const stepCount = getActiveStepCount(this.loopBars);
+    const stepDuration = getStepDurationSeconds(this.bpm);
 
     const cacheKey = `${pad.sample.url}@${ctx.sampleRate}`;
     const cached =
       this.customTapBuffers.get(pad.sample.url) ?? this.sampleCache.get(cacheKey);
     const buffer = cached ?? (await this.loadSampleBuffer(ctx, pad.sample, pad.id));
 
-    if (this.percussionBus) {
-      this.triggerPadBufferAt(
+    if (this.tapMasterFilter) {
+      this.triggerTapPadWithFx(
         ctx,
-        this.percussionBus,
+        this.tapMasterFilter,
+        this.tapReverbConvolver,
         buffer,
         pad.volume_db,
+        pad.reverb,
         velocity,
         now + 0.002
       );
     }
 
     const wasPlaying = this.isPlaying;
-    const elapsedInCycle = wasPlaying ? Math.max(0, now - this.tapCycleStartTime) : 0;
-    return { tapCtxTime: now, wasPlaying, elapsedInCycle, loopDuration };
+    if (!wasPlaying) {
+      return { stepIndex: 0, wasPlaying: false, tapCtxTime: now };
+    }
+
+    const snap = snapStepFromTiming(
+      now,
+      this.nextStepTime,
+      this.currentStep,
+      stepDuration,
+      stepCount
+    );
+
+    if (snap.isAheadOfCurrent) {
+      this.skipOnceMap.set(pad.id, {
+        stepIndex: snap.stepIndex,
+        untilTime: this.nextStepTime + stepDuration * 0.5,
+      });
+    }
+
+    return {
+      stepIndex: snap.stepIndex,
+      wasPlaying: true,
+      tapCtxTime: now,
+    };
   }
 
-  public async startTapLoopFromTap(tapCtxTime: number): Promise<void> {
+  public async startTapLoopFromFirstTap(tapCtxTime: number): Promise<void> {
     await this.resume();
     const ctx = this.ensureContext();
     if (this.isPlaying) return;
 
     await this.preloadTapPads(this.tapPads);
 
+    const stepCount = getActiveStepCount(this.loopBars);
+    const stepDuration = getStepDurationSeconds(this.bpm);
+
     this.isPlaying = true;
     this.engineMode = 'taploop';
-    this.tapCycleStartTime = tapCtxTime;
-    this.tapWindowCursor = ctx.currentTime;
-    this.currentStep = 0;
-    this.nextStepTime = tapCtxTime;
+    this.applyTapSettingsToAudioNodes();
+    // Step 0 already played live at tapCtxTime; schedule Step 1 right in tempo
+    this.currentStep = 1 % stepCount;
+    this.nextStepTime = Math.max(ctx.currentTime + 0.005, tapCtxTime + stepDuration);
+
+    if (this.onStepCallback) {
+      this.onStepCallback(0);
+    }
 
     this.startOriginalPlayback(ctx.currentTime + 0.01);
     this.timerId = window.setInterval(() => this.scheduler(), LOOKAHEAD_MS);
@@ -576,33 +702,16 @@ export class StudioAudioEngine {
 
     if (this.engineMode === 'taploop') {
       await this.preloadTapPads(this.tapPads);
-      // Preload click hi/lo synths in case click guide is enabled
-      await this.loadSampleBuffer(
-        ctx,
-        { id: 'synth-click-hi', name: 'Click Hi', url: 'synth://click_hi', source: 'synth' },
-        'click_hi'
-      );
-      await this.loadSampleBuffer(
-        ctx,
-        { id: 'synth-click-lo', name: 'Click Lo', url: 'synth://click_lo', source: 'synth' },
-        'click_lo'
-      );
-      this.isPlaying = true;
-      this.tapCycleStartTime = ctx.currentTime + 0.03;
-      this.tapWindowCursor = this.tapCycleStartTime;
-      this.startOriginalPlayback(this.tapCycleStartTime);
-      this.timerId = window.setInterval(() => this.scheduler(), LOOKAHEAD_MS);
-      return;
+    } else {
+      await this.preloadTracks(this.tracks);
     }
-
-    await this.preloadTracks(this.tracks);
 
     this.isPlaying = true;
     this.currentStep = 0;
     this.nextStepTime = ctx.currentTime + 0.03;
+    this.applyTapSettingsToAudioNodes();
 
     this.startOriginalPlayback(this.nextStepTime);
-
     this.timerId = window.setInterval(() => this.scheduler(), LOOKAHEAD_MS);
   }
 
@@ -612,13 +721,11 @@ export class StudioAudioEngine {
       window.clearInterval(this.timerId);
       this.timerId = null;
     }
+    this.skipOnceMap.clear();
     this.stopOriginalSource();
     this.currentStep = 0;
     if (this.onStepCallback) {
       this.onStepCallback(-1);
-    }
-    if (this.onTapPhaseCallback) {
-      this.onTapPhaseCallback(-1);
     }
   }
 
@@ -640,113 +747,86 @@ export class StudioAudioEngine {
 
   private scheduler(): void {
     if (!this.ctx || !this.isPlaying) return;
-
-    if (this.engineMode === 'taploop') {
-      this.scheduleTapLoopWindow();
-      return;
-    }
-
     const stepCount = getActiveStepCount(this.loopBars);
     const stepDuration = getStepDurationSeconds(this.bpm);
 
     while (this.nextStepTime < this.ctx.currentTime + SCHEDULE_AHEAD_SEC) {
       const stepToSchedule = this.currentStep % stepCount;
-      this.scheduleStep(stepToSchedule, this.nextStepTime);
+      if (this.engineMode === 'taploop') {
+        this.scheduleTapLoopStep(stepToSchedule, this.nextStepTime);
+      } else {
+        this.scheduleStep(stepToSchedule, this.nextStepTime);
+      }
       this.nextStepTime += stepDuration;
       this.currentStep = (this.currentStep + 1) % stepCount;
     }
   }
 
-  private scheduleTapLoopWindow(): void {
-    if (!this.ctx || !this.percussionBus) return;
-    const loopDuration = getLoopDurationSeconds(this.bpm, this.loopBars);
-    if (loopDuration <= 0) return;
+  private scheduleTapLoopStep(stepIndex: number, when: number): void {
+    if (!this.ctx || !this.tapMasterFilter) return;
 
-    const targetEnd = this.ctx.currentTime + SCHEDULE_AHEAD_SEC;
-    if (this.tapWindowCursor < this.ctx.currentTime - 0.1) {
-      this.tapWindowCursor = this.ctx.currentTime;
-    }
+    for (const pad of this.tapPads) {
+      if (pad.muted) continue;
+      const velocity = pad.steps[stepIndex] ?? 0;
+      if (velocity <= 0) continue;
 
-    if (targetEnd > this.tapWindowCursor) {
-      const windowStart = this.tapWindowCursor;
-      const startPhase = normalizePhase((windowStart - this.tapCycleStartTime) / loopDuration);
-      const spanPhase = (targetEnd - windowStart) / loopDuration;
-
-      for (const pad of this.tapPads) {
-        if (pad.muted || pad.events.length === 0) continue;
-        const matches = getPhaseEventsInWindow(pad.events, startPhase, spanPhase);
-        if (matches.length === 0) continue;
-
-        const buffer =
-          this.customTapBuffers.get(pad.sample.url) ??
-          this.sampleCache.get(`${pad.sample.url}@${this.ctx.sampleRate}`);
-        if (!buffer) {
-          void this.loadSampleBuffer(this.ctx, pad.sample, pad.id);
-          continue;
-        }
-
-        for (const match of matches) {
-          const when = windowStart + match.offsetRatio * loopDuration;
-          if (
-            match.event.skipUntilCtxTime &&
-            when < match.event.skipUntilCtxTime
-          ) {
-            continue;
-          }
-          this.triggerPadBufferAt(
-            this.ctx,
-            this.percussionBus,
-            buffer,
-            pad.volume_db,
-            match.event.velocity,
-            when
-          );
-          const delayMs = Math.max(0, (when - this.ctx.currentTime) * 1000);
-          const padId = pad.id;
-          window.setTimeout(() => {
-            if (this.isPlaying && this.onTapPadTriggerCallback) {
-              this.onTapPadTriggerCallback(padId);
-            }
-          }, delayMs);
-        }
+      const skipEntry = this.skipOnceMap.get(pad.id);
+      if (skipEntry && skipEntry.stepIndex === stepIndex && when <= skipEntry.untilTime) {
+        this.skipOnceMap.delete(pad.id);
+        continue;
       }
 
-      if (this.tapClickEnabled) {
-        const totalBeats = this.loopBars * 4;
-        const clickEvents = Array.from({ length: totalBeats }, (_, beatIdx) => ({
-          id: `click-${beatIdx}`,
-          phase: beatIdx / totalBeats,
-          velocity: beatIdx % 4 === 0 ? 96 : 74,
-          isBeatOne: beatIdx % 4 === 0,
-        }));
-        const clickMatches = getPhaseEventsInWindow(clickEvents, startPhase, spanPhase);
-        for (const match of clickMatches) {
-          const isBeatOne = (match.event as { isBeatOne?: boolean }).isBeatOne;
-          const synthKey = isBeatOne ? 'synth://click_hi' : 'synth://click_lo';
-          const clickBuf = this.sampleCache.get(`${synthKey}@${this.ctx.sampleRate}`);
-          if (clickBuf) {
-            const when = windowStart + match.offsetRatio * loopDuration;
-            this.triggerPadBufferAt(
-              this.ctx,
-              this.percussionBus,
-              clickBuf,
-              isBeatOne ? -3 : -5,
-              match.event.velocity,
-              when
-            );
+      const buffer =
+        this.customTapBuffers.get(pad.sample.url) ??
+        this.sampleCache.get(`${pad.sample.url}@${this.ctx.sampleRate}`);
+
+      if (buffer) {
+        this.triggerTapPadWithFx(
+          this.ctx,
+          this.tapMasterFilter,
+          this.tapReverbConvolver,
+          buffer,
+          pad.volume_db,
+          pad.reverb,
+          velocity,
+          when
+        );
+
+        const delayMs = Math.max(0, (when - this.ctx.currentTime) * 1000);
+        const padId = pad.id;
+        window.setTimeout(() => {
+          if (this.isPlaying && this.onTapPadTriggerCallback) {
+            this.onTapPadTriggerCallback(padId);
           }
-        }
+        }, delayMs);
+      } else {
+        void this.loadSampleBuffer(this.ctx, pad.sample, pad.id);
       }
-
-      this.tapWindowCursor = targetEnd;
     }
 
-    if (this.onTapPhaseCallback) {
-      const currentPhase = normalizePhase(
-        (this.ctx.currentTime - this.tapCycleStartTime) / loopDuration
-      );
-      this.onTapPhaseCallback(currentPhase);
+    // Tempo-locked metronome Click Guide when enabled (on beats 0, 4, 8, 12, ...)
+    if (this.tapClickEnabled && stepIndex % 4 === 0 && this.percussionBus) {
+      const isBeatOne = stepIndex % 16 === 0;
+      const clickKey = isBeatOne ? 'synth://click_hi' : 'synth://click_lo';
+      const clickBuf = this.sampleCache.get(`${clickKey}@${this.ctx.sampleRate}`);
+      if (clickBuf) {
+        this.triggerPadBufferAt(
+          this.ctx,
+          this.percussionBus,
+          clickBuf,
+          isBeatOne ? -3 : -5,
+          isBeatOne ? 98 : 78,
+          when
+        );
+      }
     }
+
+    const delayMs = Math.max(0, (when - this.ctx.currentTime) * 1000);
+    window.setTimeout(() => {
+      if (this.isPlaying && this.onStepCallback) {
+        this.onStepCallback(stepIndex);
+      }
+    }, delayMs);
   }
 
   private scheduleStep(stepIndex: number, when: number): void {
@@ -766,7 +846,6 @@ export class StudioAudioEngine {
       if (buffer) {
         this.triggerBufferAt(this.ctx, this.percussionBus, buffer, track, velocity, when);
       } else {
-        // Lazy load in background if swapped mid-play
         void this.loadSampleBuffer(this.ctx, sample, track.instrument_id);
       }
     }
@@ -826,12 +905,44 @@ export class StudioAudioEngine {
     source.start(when);
   }
 
+  private triggerTapPadWithFx(
+    ctx: BaseAudioContext,
+    filterDest: AudioNode,
+    reverbConvolver: ConvolverNode | null,
+    buffer: AudioBuffer,
+    volumeDb: number,
+    padReverb: number,
+    velocity: number,
+    when: number
+  ): void {
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+
+    const levelNode = ctx.createGain();
+    const velGain = Math.max(0.05, Math.min(1, velocity / 100));
+    const padGain = dbToGain(volumeDb);
+    levelNode.gain.setValueAtTime(velGain * padGain, when);
+
+    source.connect(levelNode);
+    levelNode.connect(filterDest);
+
+    if (reverbConvolver && padReverb > 0.005) {
+      const sendGain = ctx.createGain();
+      sendGain.gain.setValueAtTime(clampUnit(padReverb), when);
+      levelNode.connect(sendGain);
+      sendGain.connect(reverbConvolver);
+    }
+
+    source.start(when);
+  }
+
   public async exportWavWithClick(params: {
     bpm: number;
     loopBars: LoopBars;
     tracks: PercussionTrack[];
     blendRatio: number;
     tapPads?: TapPad[];
+    tapSettings?: TapLoopSettings;
     exportTapLoop?: boolean;
   }): Promise<Blob> {
     const sampleRate = 44100;
@@ -859,24 +970,52 @@ export class StudioAudioEngine {
     }
 
     if (params.exportTapLoop && params.tapPads) {
+      const settings = params.tapSettings ?? this.tapSettings;
+
+      const filter = offlineCtx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(clampCutoffHz(settings.cutoffHz), 0);
+      filter.Q.setValueAtTime(clampResonanceQ(settings.resonanceQ), 0);
+      filter.connect(percBus);
+
+      const convolver = offlineCtx.createConvolver();
+      convolver.buffer = this.buildReverbImpulse(
+        offlineCtx,
+        getReverbDecaySeconds(settings.reverbSize)
+      );
+      const reverbReturn = offlineCtx.createGain();
+      reverbReturn.gain.setValueAtTime(clampUnit(settings.masterReverb) * 1.25, 0);
+      convolver.connect(reverbReturn);
+      reverbReturn.connect(filter);
+
       const padBuffers = new Map<string, AudioBuffer>();
       for (const pad of params.tapPads) {
-        if (pad.muted || pad.events.length === 0) continue;
+        if (pad.muted) continue;
         const buf = await this.loadSampleBuffer(offlineCtx, pad.sample, pad.id);
         padBuffers.set(pad.id, buf);
       }
 
-      for (const pad of params.tapPads) {
-        if (pad.muted || pad.events.length === 0) continue;
-        const buf = padBuffers.get(pad.id);
-        if (!buf) continue;
-        for (const ev of pad.events) {
-          const when = normalizePhase(ev.phase) * totalDuration;
-          this.triggerPadBufferAt(offlineCtx, percBus, buf, pad.volume_db, ev.velocity, when);
+      for (let step = 0; step < stepCount; step++) {
+        const when = step * stepDuration;
+        for (const pad of params.tapPads) {
+          if (pad.muted) continue;
+          const velocity = pad.steps[step] ?? 0;
+          if (velocity <= 0) continue;
+          const buf = padBuffers.get(pad.id);
+          if (!buf) continue;
+          this.triggerTapPadWithFx(
+            offlineCtx,
+            filter,
+            convolver,
+            buf,
+            pad.volume_db,
+            pad.reverb,
+            velocity,
+            when
+          );
         }
       }
 
-      // Render synced Click Hi (Beat 1) and Click Lo (Beats 2, 3, 4)
       const clickHiBuf = await this.loadSampleBuffer(
         offlineCtx,
         { id: 'synth-click-hi', name: 'Click Hi', url: 'synth://click_hi', source: 'synth' },
@@ -887,10 +1026,9 @@ export class StudioAudioEngine {
         { id: 'synth-click-lo', name: 'Click Lo', url: 'synth://click_lo', source: 'synth' },
         'click_lo'
       );
-      const totalBeats = params.loopBars * 4;
-      for (let b = 0; b < totalBeats; b++) {
-        const when = (b / totalBeats) * totalDuration;
-        const isBeatOne = b % 4 === 0;
+      for (let step = 0; step < stepCount; step += 4) {
+        const when = step * stepDuration;
+        const isBeatOne = step % 16 === 0;
         this.triggerPadBufferAt(
           offlineCtx,
           percBus,

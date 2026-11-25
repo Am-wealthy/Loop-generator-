@@ -35,19 +35,21 @@ export interface ArrangementBlueprint {
 
 export type AnalysisStatus = 'idle' | 'analyzing' | 'ready' | 'error';
 
-export interface TapLoopEvent {
-  id: string;
-  phase: number; // Normalized [0, 1) position inside the active loop cycle
-  velocity: number; // 1-100
-  skipUntilCtxTime?: number; // Prevents same-pass double trigger on live tap
-}
-
 export interface TapPresetOption {
   id: string;
   label: string;
   category: string;
   accentColor: 'amber' | 'emerald';
   sample: SampleCandidate;
+}
+
+export type ReverbRoomSize = 'room' | 'hall' | 'cathedral';
+
+export interface TapLoopSettings {
+  cutoffHz: number; // 180 .. 18000 Hz low-pass filter
+  resonanceQ: number; // 0.5 .. 8.0 filter warmth
+  masterReverb: number; // 0 .. 1 general reverb level
+  reverbSize: ReverbRoomSize;
 }
 
 export interface TapPad {
@@ -57,7 +59,8 @@ export interface TapPad {
   accentColor: 'amber' | 'emerald';
   sample: SampleCandidate;
   customFileName?: string;
-  events: TapLoopEvent[];
+  steps: number[]; // 64 integers (0 = off, 1-100 = velocity, locked to master BPM)
   muted: boolean;
   volume_db: number;
+  reverb: number; // 0 .. 1 per-percussion reverb send
 }

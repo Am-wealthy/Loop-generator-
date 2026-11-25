@@ -1,66 +1,118 @@
 import { TAP_PAD_PRESETS } from '../data/presets.ts';
-import type { LoopBars, TapLoopEvent, TapPad } from '../types/sequencer.ts';
-import { clampBpm, getActiveStepCount, getStepDurationSeconds } from './sequencerLogic.ts';
+import type {
+  LoopBars,
+  ReverbRoomSize,
+  TapLoopSettings,
+  TapPad,
+} from '../types/sequencer.ts';
+import {
+  clampBpm,
+  getActiveStepCount,
+  getStepDurationSeconds,
+} from './sequencerLogic.ts';
 
-export function normalizePhase(rawPhase: number): number {
-  if (!Number.isFinite(rawPhase)) return 0;
-  const wrapped = ((rawPhase % 1) + 1) % 1;
-  return wrapped >= 1 ? 0 : wrapped;
+export const MIN_CUTOFF_HZ = 180;
+export const MAX_CUTOFF_HZ = 18000;
+
+export const DEFAULT_TAP_LOOP_SETTINGS: TapLoopSettings = {
+  cutoffHz: 18000,
+  resonanceQ: 1.4,
+  masterReverb: 0.45,
+  reverbSize: 'hall',
+};
+
+export function createEmptySteps(): number[] {
+  return new Array<number>(64).fill(0);
 }
 
-export function quantizePhaseTo16th(phase: number, loopBars: LoopBars): number {
-  const safePhase = normalizePhase(phase);
-  const totalSteps = getActiveStepCount(loopBars);
-  const nearestStep = Math.round(safePhase * totalSteps) % totalSteps;
-  return nearestStep / totalSteps;
+export function clampUnit(val: number): number {
+  if (!Number.isFinite(val)) return 0;
+  return Math.min(1, Math.max(0, Number(val.toFixed(3))));
 }
 
-export function computeTapPhase(
-  elapsedSeconds: number,
-  loopDurationSeconds: number,
-  quantize: boolean,
-  loopBars: LoopBars
-): number {
-  if (!Number.isFinite(loopDurationSeconds) || loopDurationSeconds <= 0) return 0;
-  const rawPhase = normalizePhase(elapsedSeconds / loopDurationSeconds);
-  return quantize ? quantizePhaseTo16th(rawPhase, loopBars) : rawPhase;
+export function clampCutoffHz(hz: number): number {
+  if (!Number.isFinite(hz)) return MAX_CUTOFF_HZ;
+  return Math.min(MAX_CUTOFF_HZ, Math.max(MIN_CUTOFF_HZ, Math.round(hz)));
 }
 
-export interface ScheduledTapMatch {
-  event: TapLoopEvent;
-  offsetRatio: number; // Relative to windowStart [0, windowSpan)
+export function clampResonanceQ(q: number): number {
+  if (!Number.isFinite(q)) return 1.4;
+  return Math.min(8, Math.max(0.5, Number(q.toFixed(1))));
 }
 
-export function getPhaseEventsInWindow(
-  events: TapLoopEvent[],
-  windowStartPhase: number,
-  windowSpanPhase: number
-): ScheduledTapMatch[] {
-  if (events.length === 0 || windowSpanPhase <= 0) return [];
+/**
+ * Logarithmic slider mapping [0..1] <-> [180..18000 Hz] so turning cutoff down
+ * sweeps smoothly through warm/muffled ("moldy") low-mid frequencies.
+ */
+export function cutoffToSliderRatio(hz: number): number {
+  const safe = clampCutoffHz(hz);
+  const ratio =
+    Math.log(safe / MIN_CUTOFF_HZ) / Math.log(MAX_CUTOFF_HZ / MIN_CUTOFF_HZ);
+  return clampUnit(ratio);
+}
 
-  const start = normalizePhase(windowStartPhase);
-  const span = Math.min(1, Math.max(0, windowSpanPhase));
-  const end = start + span;
-  const matches: ScheduledTapMatch[] = [];
+export function sliderRatioToCutoff(ratio: number): number {
+  const r = clampUnit(ratio);
+  const hz = MIN_CUTOFF_HZ * Math.pow(MAX_CUTOFF_HZ / MIN_CUTOFF_HZ, r);
+  return clampCutoffHz(hz);
+}
 
-  for (const event of events) {
-    const p = normalizePhase(event.phase);
-    if (end < 1) {
-      if (p >= start && p < end) {
-        matches.push({ event, offsetRatio: p - start });
-      }
-    } else {
-      const wrappedEnd = end - 1;
-      if (p >= start) {
-        matches.push({ event, offsetRatio: p - start });
-      } else if (p < wrappedEnd) {
-        matches.push({ event, offsetRatio: 1 - start + p });
-      }
-    }
+export function getReverbDecaySeconds(size: ReverbRoomSize): number {
+  if (size === 'room') return 0.95;
+  if (size === 'cathedral') return 3.1;
+  return 1.85;
+}
+
+export interface SnapTapResult {
+  stepIndex: number;
+  isAheadOfCurrent: boolean;
+}
+
+/**
+ * Snaps a live finger tap timestamp cleanly to the active 16th-note tempo grid.
+ * If tapped slightly ahead of nextStepTime, snaps forward to currentStep so
+ * the scheduler can suppress double-triggering on that same beat.
+ */
+export function snapStepFromTiming(
+  nowTime: number,
+  nextStepTime: number,
+  currentStep: number,
+  stepDuration: number,
+  stepCount: number
+): SnapTapResult {
+  const safeCount = Math.max(1, stepCount);
+  const normalizedCurrent = ((currentStep % safeCount) + safeCount) % safeCount;
+  const deltaToNext = nextStepTime - nowTime;
+
+  if (deltaToNext <= stepDuration * 0.48 && deltaToNext >= -0.02) {
+    return {
+      stepIndex: normalizedCurrent,
+      isAheadOfCurrent: true,
+    };
   }
 
-  matches.sort((a, b) => a.offsetRatio - b.offsetRatio);
-  return matches;
+  const prevStep = (normalizedCurrent - 1 + safeCount) % safeCount;
+  return {
+    stepIndex: prevStep,
+    isAheadOfCurrent: false,
+  };
+}
+
+/**
+ * Applies natural FL-Studio-style human dynamic phrasing across active steps:
+ * beat downbeats hit stronger while off-beats vary naturally between low ghost
+ * notes and crisp high accents without shifting anything out of tempo.
+ */
+export function humanizeSteps(steps: number[], rng: () => number = Math.random): number[] {
+  return steps.map((vel, idx) => {
+    if (vel <= 0) return 0;
+    const stepInBeat = idx % 4;
+    const targetCenter =
+      stepInBeat === 0 ? 94 : stepInBeat === 2 ? 78 : 54;
+    const jitter = Math.round((rng() * 2 - 1) * 18);
+    const blended = Math.round(vel * 0.35 + (targetCenter + jitter) * 0.65);
+    return Math.min(100, Math.max(22, blended));
+  });
 }
 
 export function estimateBpmFromTapIntervals(tapTimestampsMs: number[]): number | null {
@@ -93,14 +145,13 @@ export function getLoopDurationSeconds(bpm: number, loopBars: LoopBars): number 
   return getActiveStepCount(loopBars) * getStepDurationSeconds(bpm);
 }
 
-export function phaseToBarBeatStep(phase: number, loopBars: LoopBars): string {
-  const totalSteps = getActiveStepCount(loopBars);
-  const stepIndex = Math.floor(normalizePhase(phase) * totalSteps) % totalSteps;
-  const bar = Math.floor(stepIndex / 16) + 1;
-  const stepInBar = stepIndex % 16;
-  const beat = Math.floor(stepInBar / 4) + 1;
-  const sub = (stepInBar % 4) + 1;
-  return `${String(bar).padStart(2, '0')}.${beat}.${sub}`;
+export function countActiveSteps(steps: number[], loopBars: LoopBars): number {
+  const limit = getActiveStepCount(loopBars);
+  let count = 0;
+  for (let i = 0; i < limit; i++) {
+    if ((steps[i] ?? 0) > 0) count++;
+  }
+  return count;
 }
 
 export function createDefaultTapPads(): TapPad[] {
@@ -110,9 +161,10 @@ export function createDefaultTapPads(): TapPad[] {
     category: preset.category,
     accentColor: preset.accentColor,
     sample: preset.sample,
-    events: [],
+    steps: createEmptySteps(),
     muted: false,
     volume_db: -1.5,
+    reverb: preset.category === 'Bass' || preset.category === 'Low End' ? 0.05 : 0.25,
   }));
 }
 
@@ -122,14 +174,16 @@ export function createNextTapPad(existingCount: number): TapPad {
       ? existingCount
       : existingCount % TAP_PAD_PRESETS.length;
   const preset = TAP_PAD_PRESETS[presetIndex];
+  const isLowEnd = preset.category === 'Bass' || preset.category === 'Low End';
   return {
     id: `pad-${Date.now()}-${existingCount + 1}`,
     name: preset.label,
     category: preset.category,
     accentColor: preset.accentColor,
     sample: preset.sample,
-    events: [],
+    steps: createEmptySteps(),
     muted: false,
     volume_db: -1.5,
+    reverb: isLowEnd ? 0.05 : 0.25,
   };
 }

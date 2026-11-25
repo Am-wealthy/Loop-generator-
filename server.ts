@@ -102,129 +102,177 @@ async function createServer() {
     });
   });
 
-  app.post('/api/analyze-audio', async (req, res) => {
-    try {
-      const ai = getGeminiClient();
-      if (!ai) {
-        res.status(503).json({
+  async function runGeminiAudioAnalysis(params: {
+    audioBase64: string;
+    mimeType: string;
+    fileName: string;
+    analysisMode: string;
+    targetGroove?: string;
+  }) {
+    const ai = getGeminiClient();
+    if (!ai) {
+      return {
+        status: 503,
+        body: {
           error:
             'Gemini API key is not configured on the server. Please add GEMINI_API_KEY in Settings > Secrets.',
-        });
-        return;
-      }
+        },
+      };
+    }
 
-      const { audioBase64, mimeType, fileName, analysisMode, targetGroove } = req.body ?? {};
-      if (typeof audioBase64 !== 'string' || audioBase64.length < 100) {
-        res.status(400).json({ error: 'A valid audio file payload is required.' });
-        return;
-      }
+    const { audioBase64, mimeType, fileName, analysisMode, targetGroove } = params;
+    if (!audioBase64 || audioBase64.length < 100) {
+      return { status: 400, body: { error: 'A valid audio file payload is required.' } };
+    }
 
-      // ~20 MB raw binary cap (~27 MB base64)
-      if (audioBase64.length > 28_000_000) {
-        res.status(413).json({
-          error: 'Audio file exceeds the 20 MB analysis limit. Trim or compress the clip and try again.',
-        });
-        return;
-      }
+    if (audioBase64.length > 28_000_000) {
+      return {
+        status: 413,
+        body: {
+          error:
+            'Audio file exceeds the 20 MB analysis limit. Trim or compress the clip and try again.',
+        },
+      };
+    }
 
-      const baseMime =
-        typeof mimeType === 'string'
-          ? mimeType.split(';')[0].trim().toLowerCase()
-          : '';
-      const mappedMime =
-        baseMime === 'video/mp4' || baseMime === 'audio/x-m4a' || baseMime === 'audio/m4a'
-          ? 'audio/mp4'
-          : baseMime === 'audio/x-aac'
-          ? 'audio/aac'
-          : baseMime === 'audio/x-flac'
-          ? 'audio/flac'
-          : baseMime;
-      const normalizedMime = ALLOWED_AUDIO_MIMES.has(mappedMime)
-        ? mappedMime
-        : 'audio/mpeg';
+    const baseMime = mimeType.split(';')[0].trim().toLowerCase();
+    const mappedMime =
+      baseMime === 'video/mp4' || baseMime === 'audio/x-m4a' || baseMime === 'audio/m4a'
+        ? 'audio/mp4'
+        : baseMime === 'audio/x-aac'
+        ? 'audio/aac'
+        : baseMime === 'audio/x-flac'
+        ? 'audio/flac'
+        : baseMime;
+    const normalizedMime = ALLOWED_AUDIO_MIMES.has(mappedMime)
+      ? mappedMime
+      : 'audio/mpeg';
 
-      const safeFileName =
-        typeof fileName === 'string' ? fileName.slice(0, 120) : 'uploaded-audio';
-      const modeInstruction =
-        analysisMode === 'extract'
-          ? 'USER SELECTED MODE: CASE A (EXTRACT EXACT LOOP). This track already contains percussion/drums. Transcribe the exact rhythmic placement of every auxiliary percussion element used in the music across the 64-step grid (ignoring heavy kick drum), and set has_existing_percussion to true.'
-          : `USER SELECTED MODE: CASE B (COMPOSE PERCUSSION FOR DRUMLESS MUSIC). This recording needs a percussion loop generated for it. Compose an authentic, infectious Nigerian Afro-gospel percussion arrangement locked tightly into the vocal/keyboard rhythm${
-              typeof targetGroove === 'string' && targetGroove.trim() && targetGroove !== 'auto'
-                ? ` with a ${targetGroove.trim()} feel`
-                : ''
-            }, and set has_existing_percussion to false.`;
+    const safeFileName = fileName.slice(0, 120) || 'uploaded-audio';
+    const modeInstruction =
+      analysisMode === 'extract'
+        ? 'USER SELECTED MODE: CASE A (EXTRACT EXACT LOOP). This track already contains percussion/drums. Transcribe the exact rhythmic placement of every auxiliary percussion element used in the music across the 64-step grid (ignoring heavy kick drum), and set has_existing_percussion to true.'
+        : `USER SELECTED MODE: CASE B (COMPOSE PERCUSSION FOR DRUMLESS MUSIC). This recording needs a percussion loop generated for it. Compose an authentic, infectious Nigerian Afro-gospel percussion arrangement locked tightly into the vocal/keyboard rhythm${
+            typeof targetGroove === 'string' && targetGroove.trim() && targetGroove !== 'auto'
+              ? ` with a ${targetGroove.trim()} feel`
+              : ''
+          }, and set has_existing_percussion to false.`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: normalizedMime,
-                data: audioBase64,
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              mimeType: normalizedMime,
+              data: audioBase64,
+            },
+          },
+          {
+            text: `Analyze this uploaded audio ("${safeFileName}"). ${modeInstruction} Always include synced click_hi and click_lo tracks across the 64-step grid.`,
+          },
+        ],
+      },
+      config: {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            detected_bpm: { type: Type.NUMBER },
+            groove_style: { type: Type.STRING },
+            time_signature: { type: Type.STRING },
+            has_existing_percussion: { type: Type.BOOLEAN },
+            tracks: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  instrument_id: { type: Type.STRING },
+                  display_name: { type: Type.STRING },
+                  sample_search_query: { type: Type.STRING },
+                  volume_db: { type: Type.NUMBER },
+                  pan: { type: Type.NUMBER },
+                  steps: {
+                    type: Type.ARRAY,
+                    items: { type: Type.INTEGER },
+                  },
+                },
+                required: [
+                  'instrument_id',
+                  'display_name',
+                  'sample_search_query',
+                  'volume_db',
+                  'pan',
+                  'steps',
+                ],
               },
             },
-            {
-              text: `Analyze this uploaded audio ("${safeFileName}"). ${modeInstruction} Always include synced click_hi and click_lo tracks across the 64-step grid.`,
-            },
+          },
+          required: [
+            'detected_bpm',
+            'groove_style',
+            'time_signature',
+            'has_existing_percussion',
+            'tracks',
           ],
         },
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              detected_bpm: { type: Type.NUMBER },
-              groove_style: { type: Type.STRING },
-              time_signature: { type: Type.STRING },
-              has_existing_percussion: { type: Type.BOOLEAN },
-              tracks: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    instrument_id: { type: Type.STRING },
-                    display_name: { type: Type.STRING },
-                    sample_search_query: { type: Type.STRING },
-                    volume_db: { type: Type.NUMBER },
-                    pan: { type: Type.NUMBER },
-                    steps: {
-                      type: Type.ARRAY,
-                      items: { type: Type.INTEGER },
-                    },
-                  },
-                  required: [
-                    'instrument_id',
-                    'display_name',
-                    'sample_search_query',
-                    'volume_db',
-                    'pan',
-                    'steps',
-                  ],
-                },
-              },
-            },
-            required: [
-              'detected_bpm',
-              'groove_style',
-              'time_signature',
-              'has_existing_percussion',
-              'tracks',
-            ],
-          },
-        },
-      });
+      },
+    });
 
-      const rawText = (response.text ?? '').trim();
-      if (!rawText) {
-        res.status(502).json({ error: 'Gemini returned an empty analysis response.' });
-        return;
+    const rawText = (response.text ?? '').trim();
+    if (!rawText) {
+      return { status: 502, body: { error: 'Gemini returned an empty analysis response.' } };
+    }
+
+    const parsed = JSON.parse(rawText);
+    return { status: 200, body: normalizeArrangement(parsed) };
+  }
+
+  app.post(
+    '/api/analyze-audio-raw',
+    express.raw({ type: '*/*', limit: '22mb' }),
+    async (req, res) => {
+      try {
+        const rawBuf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        if (rawBuf.byteLength < 64) {
+          res.status(400).json({ error: 'A valid audio file payload is required.' });
+          return;
+        }
+        const mimeType = String(req.header('x-audio-mime') || 'audio/mpeg');
+        const rawName = String(req.header('x-file-name') || 'uploaded-audio');
+        const fileName = decodeURIComponent(rawName);
+        const analysisMode = String(req.header('x-analysis-mode') || 'compose');
+        const targetGroove = req.header('x-target-groove') || undefined;
+
+        const result = await runGeminiAudioAnalysis({
+          audioBase64: rawBuf.toString('base64'),
+          mimeType,
+          fileName,
+          analysisMode,
+          targetGroove,
+        });
+        res.status(result.status).json(result.body);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Failed to analyze audio with Gemini.';
+        console.error('Gemini raw analysis error:', message);
+        res.status(500).json({ error: message });
       }
+    }
+  );
 
-      const parsed = JSON.parse(rawText);
-      const normalized = normalizeArrangement(parsed);
-      res.json(normalized);
+  app.post('/api/analyze-audio', async (req, res) => {
+    try {
+      const { audioBase64, mimeType, fileName, analysisMode, targetGroove } = req.body ?? {};
+      const result = await runGeminiAudioAnalysis({
+        audioBase64: typeof audioBase64 === 'string' ? audioBase64 : '',
+        mimeType: typeof mimeType === 'string' ? mimeType : '',
+        fileName: typeof fileName === 'string' ? fileName : 'uploaded-audio',
+        analysisMode: typeof analysisMode === 'string' ? analysisMode : 'compose',
+        targetGroove: typeof targetGroove === 'string' ? targetGroove : undefined,
+      });
+      res.status(result.status).json(result.body);
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Failed to analyze audio with Gemini.';

@@ -4,6 +4,7 @@ import { BottomDock } from './components/BottomDock';
 import { ExportModal } from './components/ExportModal';
 import { FreesoundModal } from './components/FreesoundModal';
 import { SequencerMatrix } from './components/SequencerMatrix';
+import { StemBuilderStudio } from './components/StemBuilderStudio';
 import { StudioHeader } from './components/StudioHeader';
 import { TapLoopStudio } from './components/TapLoopStudio';
 import { VoiceDirectorFab } from './components/VoiceDirectorFab';
@@ -14,9 +15,15 @@ import type {
   AnalysisStatus,
   ArrangementBlueprint,
   ExportOptions,
+  KeyboardSoundId,
   LoopBars,
   PercussionTrack,
   SampleCandidate,
+  ScaleType,
+  StemChannel,
+  StemLoopSource,
+  StemNote,
+  StemVoiceMode,
   StudioPage,
   TapLoopSettings,
   TapPad,
@@ -46,6 +53,15 @@ import {
   findMatchingTapPadIndex,
   findMatchingTrackIndex,
 } from './utils/voiceCommandLogic';
+import {
+  createDefaultStemChannels,
+  createNextStemChannel,
+  snapNotesToScale,
+  toggleStemNote,
+  transposeNotes,
+  upsertStemNote,
+  type MusicalKey,
+} from './utils/stemBuilderLogic';
 
 function extractWaveformPeaks(buffer: AudioBuffer, binCount = 96): number[] {
   const channel = buffer.getChannelData(0);
@@ -153,6 +169,17 @@ export default function App() {
   const tapTempoHistoryRef = useRef<number[]>([]);
   const flashTimersRef = useRef<Record<string, number>>({});
 
+  // Stem Builder state
+  const [stemChannels, setStemChannels] = useState<StemChannel[]>(() =>
+    createDefaultStemChannels()
+  );
+  const [selectedStemId, setSelectedStemId] = useState<string>('stem-rhodes');
+  const [stemLoopSource, setStemLoopSource] = useState<StemLoopSource>('sequencer');
+  const [stemLoopMuted, setStemLoopMuted] = useState(false);
+  const [stemLoopVolumeDb, setStemLoopVolumeDb] = useState(-2);
+  const [stemKey, setStemKey] = useState<MusicalKey>('C');
+  const [stemScale, setStemScale] = useState<ScaleType>('major');
+
   useEffect(() => {
     engineRef.current?.updateState({
       bpm,
@@ -164,7 +191,12 @@ export default function App() {
   }, [bpm, loopBars, blendRatio, tracks, metronomeEnabled]);
 
   useEffect(() => {
-    const mode = activePage === 'taploop' ? 'taploop' : 'sequencer';
+    const mode =
+      activePage === 'taploop'
+        ? 'taploop'
+        : activePage === 'stems'
+        ? 'stems'
+        : 'sequencer';
     engineRef.current?.updateTapLoopState({
       mode,
       tapPads,
@@ -174,10 +206,22 @@ export default function App() {
   }, [activePage, tapPads, metronomeEnabled, tapSettings]);
 
   useEffect(() => {
-    if (activePage === 'taploop') {
+    engineRef.current?.updateStemState({
+      stemChannels,
+      stemLoopSource,
+      stemLoopMuted,
+      stemLoopVolumeDb,
+    });
+  }, [stemChannels, stemLoopSource, stemLoopMuted, stemLoopVolumeDb]);
+
+  useEffect(() => {
+    if (activePage === 'taploop' || activePage === 'stems') {
       void engineRef.current?.preloadTapPads(tapPads);
     }
-  }, [activePage, tapPads]);
+    if (activePage === 'stems') {
+      void engineRef.current?.preloadTracks(tracks);
+    }
+  }, [activePage, tapPads, tracks]);
 
   const triggerPadFlash = useCallback((padId: string) => {
     setFlashingPadIds((prev) => ({ ...prev, [padId]: Date.now() }));
@@ -273,9 +317,9 @@ export default function App() {
 
   const handleSelectPage = useCallback(
     (nextPage: StudioPage) => {
-      const wasTapLoop = activePage === 'taploop';
-      const willBeTapLoop = nextPage === 'taploop';
-      if (wasTapLoop !== willBeTapLoop && isPlaying) {
+      const getGroup = (p: StudioPage) =>
+        p === 'taploop' ? 'taploop' : p === 'stems' ? 'stems' : 'sequencer';
+      if (getGroup(activePage) !== getGroup(nextPage) && isPlaying) {
         engineRef.current?.stop();
         setIsPlaying(false);
         setCurrentStep(-1);
@@ -754,12 +798,191 @@ export default function App() {
     }
   };
 
+  // Stem Builder Handlers
+  const handleAddStemChannel = () => {
+    const next = createNextStemChannel(stemChannels.length);
+    setStemChannels((prev) => [...prev, next]);
+    setSelectedStemId(next.id);
+  };
+
+  const handleRemoveStemChannel = (channelId: string) => {
+    if (stemChannels.length <= 1) return;
+    engineRef.current?.clearStemHumAudio(channelId);
+    const remaining = stemChannels.filter((c) => c.id !== channelId);
+    setStemChannels(remaining);
+    if (selectedStemId === channelId && remaining[0]) {
+      setSelectedStemId(remaining[0].id);
+    }
+  };
+
+  const handleStemSoundChange = (channelId: string, soundId: KeyboardSoundId) => {
+    setStemChannels((prev) =>
+      prev.map((ch) =>
+        ch.id === channelId
+          ? {
+              ...ch,
+              soundId,
+              voiceMode: 'keyboard',
+            }
+          : ch
+      )
+    );
+    void engineRef.current?.triggerKeyboardNoteNow(soundId, 60, 88, 0.35);
+  };
+
+  const handleStemVoiceModeChange = (channelId: string, voiceMode: StemVoiceMode) => {
+    setStemChannels((prev) =>
+      prev.map((ch) => (ch.id === channelId ? { ...ch, voiceMode } : ch))
+    );
+  };
+
+  const handleToggleStemMute = (channelId: string) => {
+    setStemChannels((prev) =>
+      prev.map((ch) => (ch.id === channelId ? { ...ch, muted: !ch.muted } : ch))
+    );
+  };
+
+  const handleToggleStemSolo = (channelId: string) => {
+    setStemChannels((prev) =>
+      prev.map((ch) => (ch.id === channelId ? { ...ch, soloed: !ch.soloed } : ch))
+    );
+  };
+
+  const handleStemVolumeChange = (channelId: string, db: number) => {
+    setStemChannels((prev) =>
+      prev.map((ch) =>
+        ch.id === channelId ? { ...ch, volume_db: clampVolumeDb(db) } : ch
+      )
+    );
+  };
+
+  const handleToggleStemNote = (
+    channelId: string,
+    step: number,
+    midi: number,
+    durationSteps: number
+  ) => {
+    const ch = stemChannels.find((c) => c.id === channelId);
+    const wasPresent = ch?.notes.some((n) => n.step === step && n.midi === midi);
+    setStemChannels((prev) =>
+      prev.map((c) =>
+        c.id === channelId
+          ? { ...c, notes: toggleStemNote(c.notes, step, midi, durationSteps, 90) }
+          : c
+      )
+    );
+    if (!wasPresent && ch) {
+      void engineRef.current?.triggerKeyboardNoteNow(
+        ch.soundId,
+        midi,
+        90,
+        0.32,
+        ch.volume_db,
+        ch.pan
+      );
+    }
+  };
+
+  const handleRecordStemNote = useCallback((channelId: string, note: StemNote) => {
+    setStemChannels((prev) =>
+      prev.map((c) =>
+        c.id === channelId ? { ...c, notes: upsertStemNote(c.notes, note) } : c
+      )
+    );
+  }, []);
+
+  const handleClearStemNotes = (channelId: string) => {
+    setStemChannels((prev) =>
+      prev.map((c) => (c.id === channelId ? { ...c, notes: [] } : c))
+    );
+  };
+
+  const handleFixOffKeyNotes = (channelId: string) => {
+    setStemChannels((prev) =>
+      prev.map((c) =>
+        c.id === channelId
+          ? {
+              ...c,
+              voiceMode: 'keyboard',
+              notes: snapNotesToScale(c.notes, stemKey, stemScale),
+            }
+          : c
+      )
+    );
+    setStatusBanner(`Snapped notes to ${stemKey} ${stemScale} and switched to keyboard voice`);
+    window.setTimeout(() => setStatusBanner(null), 2800);
+  };
+
+  const handleTransposeStem = (channelId: string, semitones: number) => {
+    setStemChannels((prev) =>
+      prev.map((c) =>
+        c.id === channelId
+          ? { ...c, notes: transposeNotes(c.notes, semitones) }
+          : c
+      )
+    );
+  };
+
+  const handlePlayKeyboardKey = async (midi: number, recordToRoll: boolean) => {
+    const active = stemChannels.find((c) => c.id === selectedStemId) ?? stemChannels[0];
+    if (!active || !engineRef.current) return;
+
+    const timing = await engineRef.current.triggerKeyboardNoteNow(
+      active.soundId,
+      midi,
+      92,
+      0.38,
+      active.volume_db,
+      active.pan
+    );
+
+    if (recordToRoll && timing.wasPlaying) {
+      handleRecordStemNote(active.id, {
+        step: timing.stepIndex,
+        midi,
+        durationSteps: 2,
+        velocity: 92,
+      });
+    }
+  };
+
+  const handleEnsurePlaying = async () => {
+    if (!engineRef.current || isPlaying) return;
+    setIsPlaying(true);
+    await engineRef.current.start();
+  };
+
+  const handleSaveHumAudio = async (channelId: string, blob: Blob) => {
+    try {
+      await engineRef.current?.loadStemHumAudio(channelId, blob);
+      setStemChannels((prev) =>
+        prev.map((ch) =>
+          ch.id === channelId ? { ...ch, hasHumAudio: true } : ch
+        )
+      );
+    } catch {
+      // If MediaRecorder codec cannot be decoded on this browser, keep MIDI notes cleanly
+    }
+  };
+
+  const handleClearHumAudio = (channelId: string) => {
+    engineRef.current?.clearStemHumAudio(channelId);
+    setStemChannels((prev) =>
+      prev.map((ch) =>
+        ch.id === channelId
+          ? { ...ch, hasHumAudio: false, voiceMode: 'keyboard' }
+          : ch
+      )
+    );
+  };
+
   const handleConfirmExport = async (options: ExportOptions) => {
     if (!engineRef.current || isExporting) return;
     setIsExporting(true);
     setStatusBanner(null);
     try {
       const isTapExport = activePage === 'taploop';
+      const isStemsExport = activePage === 'stems';
       const wavBlob = await engineRef.current.exportWavWithClick({
         bpm,
         loopBars,
@@ -768,11 +991,17 @@ export default function App() {
         tapPads,
         tapSettings,
         exportTapLoop: isTapExport,
+        exportStems: isStemsExport,
+        stemChannels,
+        stemLoopSource,
+        stemLoopMuted,
         exportOptions: options,
       });
       const url = URL.createObjectURL(wavBlob);
       const a = document.createElement('a');
-      const slug = isTapExport
+      const slug = isStemsExport
+        ? 'stem-mix'
+        : isTapExport
         ? 'tap-loop'
         : grooveStyle.toLowerCase().replace(/[^a-z0-9]+/g, '-');
       const durLabel =
@@ -829,7 +1058,8 @@ export default function App() {
             action.page === 'compose' ||
             action.page === 'extract' ||
             action.page === 'taploop' ||
-            action.page === 'sequencer'
+            action.page === 'sequencer' ||
+            action.page === 'stems'
           ) {
             currentPageTarget = action.page;
             handleSelectPage(action.page);
@@ -1101,6 +1331,54 @@ export default function App() {
             }}
           />
         )}
+
+        {activePage === 'stems' && (
+          <StemBuilderStudio
+            bpm={bpm}
+            loopBars={loopBars}
+            isPlaying={isPlaying}
+            currentStep={currentStep}
+            activeBar={activeBar}
+            followPlayhead={followPlayhead}
+            tracks={tracks}
+            tapPads={tapPads}
+            stemLoopSource={stemLoopSource}
+            stemLoopMuted={stemLoopMuted}
+            stemLoopVolumeDb={stemLoopVolumeDb}
+            stemChannels={stemChannels}
+            selectedChannelId={selectedStemId}
+            rootKey={stemKey}
+            scaleType={stemScale}
+            onSelectBar={(bar) => {
+              setFollowPlayhead(false);
+              setActiveBar(bar);
+            }}
+            onToggleFollowPlayhead={() => setFollowPlayhead((f) => !f)}
+            onSelectLoopSource={setStemLoopSource}
+            onToggleLoopMuted={() => setStemLoopMuted((v) => !v)}
+            onLoopVolumeChange={setStemLoopVolumeDb}
+            onSelectChannel={setSelectedStemId}
+            onAddChannel={handleAddStemChannel}
+            onRemoveChannel={handleRemoveStemChannel}
+            onChannelSoundChange={handleStemSoundChange}
+            onChannelVoiceModeChange={handleStemVoiceModeChange}
+            onChannelMuteToggle={handleToggleStemMute}
+            onChannelSoloToggle={handleToggleStemSolo}
+            onChannelVolumeChange={handleStemVolumeChange}
+            onToggleNote={handleToggleStemNote}
+            onRecordNote={handleRecordStemNote}
+            onClearChannelNotes={handleClearStemNotes}
+            onFixOffKeyNotes={handleFixOffKeyNotes}
+            onTransposeChannel={handleTransposeStem}
+            onRootKeyChange={setStemKey}
+            onScaleTypeChange={setStemScale}
+            onPlayKeyboardKey={(midi, rec) => void handlePlayKeyboardKey(midi, rec)}
+            onEnsurePlaying={handleEnsurePlaying}
+            getPlaybackTiming={() => engineRef.current!.getCurrentPlaybackTiming()}
+            onSaveHumAudio={handleSaveHumAudio}
+            onClearHumAudio={handleClearHumAudio}
+          />
+        )}
       </main>
 
       <VoiceDirectorFab
@@ -1143,7 +1421,11 @@ export default function App() {
         defaultReverbSize={tapSettings.reverbSize}
         defaultIncludeClick={metronomeEnabled}
         activeSourceLabel={
-          activePage === 'taploop' ? 'Tap Loop Mix' : `${grooveStyle} Sequencer`
+          activePage === 'stems'
+            ? 'Stem Builder Multi-Track Mix'
+            : activePage === 'taploop'
+            ? 'Tap Loop Mix'
+            : `${grooveStyle} Sequencer`
         }
         onExport={(opts) => void handleConfirmExport(opts)}
         onClose={() => setIsExportModalOpen(false)}

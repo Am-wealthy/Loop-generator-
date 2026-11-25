@@ -1,5 +1,5 @@
 import React from 'react';
-import { Disc3, Hand, Play, Sliders, Sparkles, Square, Timer } from 'lucide-react';
+import { Disc3, Hand, Layers, Play, Sliders, Sparkles, Square, Timer } from 'lucide-react';
 import type { LoopBars, StudioPage } from '../types/sequencer';
 import { formatBarBeatStep } from '../utils/sequencerLogic';
 
@@ -48,6 +48,12 @@ const NAV_ITEMS: Array<{
     label: 'Studio Sequencer',
     shortLabel: 'Sequencer',
     icon: Sliders,
+  },
+  {
+    id: 'stems',
+    label: 'Stem Builder',
+    shortLabel: 'Stems',
+    icon: Layers,
   },
 ];
 
@@ -197,7 +203,7 @@ export const BottomDock: React.FC<BottomDockProps> = ({
       {/* Bottom Navigation Bar */}
       <nav
         aria-label="Studio pages"
-        className="mx-auto grid max-w-[1440px] grid-cols-4"
+        className="mx-auto grid max-w-[1440px] grid-cols-5"
       >
         {NAV_ITEMS.map((item) => {
           const Icon = item.icon;
@@ -208,7 +214,7 @@ export const BottomDock: React.FC<BottomDockProps> = ({
               type="button"
               onClick={() => onSelectPage(item.id)}
               aria-current={isActive ? 'page' : undefined}
-              className={`relative flex h-11 items-center justify-center gap-1 px-1 text-[10px] font-semibold transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400 sm:h-12 sm:gap-2 sm:px-2 sm:text-xs ${
+              className={`relative flex h-11 items-center justify-center gap-1 px-0.5 text-[10px] font-semibold transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-400 sm:h-12 sm:gap-2 sm:px-2 sm:text-xs ${
                 isActive
                   ? 'text-amber-400 bg-amber-500/5'
                   : 'text-zinc-400 hover:bg-zinc-900/50 hover:text-zinc-200'

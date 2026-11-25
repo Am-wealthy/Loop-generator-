@@ -1,6 +1,6 @@
 export type LoopBars = 1 | 2 | 4;
 
-export type StudioPage = 'compose' | 'extract' | 'taploop' | 'sequencer';
+export type StudioPage = 'compose' | 'extract' | 'taploop' | 'sequencer' | 'stems';
 
 export type AnalysisMode = 'compose' | 'extract';
 
@@ -116,3 +116,41 @@ export interface VoiceCommandResponse {
   spoken_summary: string;
   actions: VoiceAction[];
 }
+
+export type KeyboardSoundId =
+  | 'grand_piano'
+  | 'rhodes_ep'
+  | 'gospel_organ'
+  | 'synth_brass'
+  | 'warm_pad'
+  | 'worship_bass'
+  | 'marimba_pluck'
+  | 'choir_voice';
+
+export type StemVoiceMode = 'keyboard' | 'hum_audio';
+
+export type StemLoopSource = 'sequencer' | 'taploop';
+
+export type ScaleType = 'major' | 'minor' | 'pentatonic';
+
+export interface StemNote {
+  step: number; // 0..63
+  midi: number; // 36..84
+  durationSteps: number; // 1..16
+  velocity: number; // 1..100
+}
+
+export interface StemChannel {
+  id: string;
+  name: string;
+  color: 'amber' | 'emerald' | 'sky' | 'rose' | 'violet';
+  soundId: KeyboardSoundId;
+  voiceMode: StemVoiceMode;
+  hasHumAudio: boolean;
+  muted: boolean;
+  soloed: boolean;
+  volume_db: number;
+  pan: number;
+  notes: StemNote[];
+}
+

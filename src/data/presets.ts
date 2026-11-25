@@ -1,4 +1,8 @@
-import type { ArrangementBlueprint, SampleCandidate } from '../types/sequencer.ts';
+import type {
+  ArrangementBlueprint,
+  SampleCandidate,
+  TapPresetOption,
+} from '../types/sequencer.ts';
 
 const DIRT_BASE = 'https://cdn.jsdelivr.net/gh/tidalcycles/Dirt-Samples@master';
 
@@ -193,3 +197,106 @@ export const INITIAL_HIGHLIFE_ARRANGEMENT: ArrangementBlueprint = {
     },
   ],
 };
+
+export const TAP_PAD_PRESETS: TapPresetOption[] = [
+  {
+    id: 'preset-shekere',
+    label: 'Shekere Shaker',
+    category: 'Shaker',
+    accentColor: 'amber',
+    sample: FALLBACK_SAMPLE_CATALOG.shekere[0],
+  },
+  {
+    id: 'preset-agogo',
+    label: 'Wooden Agogo',
+    category: 'Timeline',
+    accentColor: 'amber',
+    sample: FALLBACK_SAMPLE_CATALOG.wooden_agogo[0],
+  },
+  {
+    id: 'preset-conga-slap',
+    label: 'Conga Slap',
+    category: 'Hand Drum',
+    accentColor: 'amber',
+    sample: FALLBACK_SAMPLE_CATALOG.conga_slap[0],
+  },
+  {
+    id: 'preset-conga-open',
+    label: 'Conga Low Open',
+    category: 'Hand Drum',
+    accentColor: 'amber',
+    sample: FALLBACK_SAMPLE_CATALOG.conga_low_open[0],
+  },
+  {
+    id: 'preset-cowbell',
+    label: 'Cowbell',
+    category: 'Bell',
+    accentColor: 'amber',
+    sample: FALLBACK_SAMPLE_CATALOG.cowbell[0],
+  },
+  {
+    id: 'preset-tambourine',
+    label: 'Tambourine',
+    category: 'Jingle',
+    accentColor: 'amber',
+    sample: FALLBACK_SAMPLE_CATALOG.tambourine[0],
+  },
+  {
+    id: 'preset-warm-bass',
+    label: 'Warm Sub Bass',
+    category: 'Bass',
+    accentColor: 'emerald',
+    sample: {
+      id: 'synth-warm-bass',
+      name: 'Warm Praise Bass',
+      url: 'synth://warm_bass',
+      source: 'synth',
+    },
+  },
+  {
+    id: 'preset-talking-drum',
+    label: 'Talking Drum',
+    category: 'Gangan',
+    accentColor: 'amber',
+    sample: FALLBACK_SAMPLE_CATALOG.talking_drum[0],
+  },
+  {
+    id: 'preset-deep-bass',
+    label: 'Deep 808 Bass',
+    category: 'Bass',
+    accentColor: 'emerald',
+    sample: {
+      id: 'synth-deep-bass',
+      name: 'Deep 808 Sub',
+      url: 'synth://deep_bass',
+      source: 'synth',
+    },
+  },
+  {
+    id: 'preset-kick-thump',
+    label: 'Kick Thump',
+    category: 'Low End',
+    accentColor: 'emerald',
+    sample: {
+      id: 'synth-kick-thump',
+      name: 'Acoustic Kick Thump',
+      url: 'synth://kick_thump',
+      source: 'synth',
+    },
+  },
+  {
+    id: 'preset-clave',
+    label: 'Wood Clave Snap',
+    category: 'Timeline',
+    accentColor: 'amber',
+    sample: FALLBACK_SAMPLE_CATALOG.wooden_agogo[4],
+  },
+  {
+    id: 'preset-shaker-brush',
+    label: 'Crisp Shaker Brush',
+    category: 'Shaker',
+    accentColor: 'amber',
+    sample: FALLBACK_SAMPLE_CATALOG.shekere[1],
+  },
+];
+

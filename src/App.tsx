@@ -1,18 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { StudioAudioEngine } from './audio/AudioEngine';
+import { BottomDock } from './components/BottomDock';
 import { FreesoundModal } from './components/FreesoundModal';
 import { SequencerMatrix } from './components/SequencerMatrix';
 import { StudioHeader } from './components/StudioHeader';
-import { TransportDock } from './components/TransportDock';
+import { TapLoopStudio } from './components/TapLoopStudio';
 import { WaveformDropzone } from './components/WaveformDropzone';
 import { INITIAL_HIGHLIFE_ARRANGEMENT } from './data/presets';
 import type {
+  AnalysisMode,
   AnalysisStatus,
   ArrangementBlueprint,
-  GeminiAnalysisModel,
   LoopBars,
   PercussionTrack,
   SampleCandidate,
+  StudioPage,
+  TapPad,
+  TapPresetOption,
 } from './types/sequencer';
 import {
   clampBpm,
@@ -20,6 +24,13 @@ import {
   clampVolumeDb,
   hydrateTracksWithFallbackSamples,
 } from './utils/sequencerLogic';
+import {
+  computeTapPhase,
+  createDefaultTapPads,
+  createNextTapPad,
+  estimateBpmFromTapIntervals,
+  phaseToBarBeatStep,
+} from './utils/tapLoopLogic';
 
 function extractWaveformPeaks(buffer: AudioBuffer, binCount = 96): number[] {
   const channel = buffer.getChannelData(0);
@@ -53,11 +64,41 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
+function inferAudioMimeType(file: File): string {
+  const rawType = file.type.split(';')[0].trim().toLowerCase();
+  if (rawType && rawType !== 'application/octet-stream') {
+    if (rawType === 'video/mp4' || rawType === 'audio/x-m4a' || rawType === 'audio/m4a') {
+      return 'audio/mp4';
+    }
+    return rawType;
+  }
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  const map: Record<string, string> = {
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    m4a: 'audio/mp4',
+    mp4: 'audio/mp4',
+    aac: 'audio/aac',
+    ogg: 'audio/ogg',
+    opus: 'audio/ogg',
+    flac: 'audio/flac',
+    webm: 'audio/webm',
+    aiff: 'audio/aiff',
+    aif: 'audio/aiff',
+    amr: 'audio/amr',
+    '3gp': 'audio/3gpp',
+  };
+  return map[ext] || 'audio/mpeg';
+}
+
 export default function App() {
   const engineRef = useRef<StudioAudioEngine | null>(null);
   if (!engineRef.current) {
     engineRef.current = new StudioAudioEngine();
   }
+
+  const [activePage, setActivePage] = useState<StudioPage>('compose');
+  const [targetGroove, setTargetGroove] = useState<string>('auto');
 
   const [bpm, setBpm] = useState<number>(INITIAL_HIGHLIFE_ARRANGEMENT.detected_bpm);
   const [grooveStyle, setGrooveStyle] = useState<string>(
@@ -65,9 +106,6 @@ export default function App() {
   );
   const [timeSignature, setTimeSignature] = useState<string>(
     INITIAL_HIGHLIFE_ARRANGEMENT.time_signature
-  );
-  const [hasExistingPercussion, setHasExistingPercussion] = useState<boolean>(
-    INITIAL_HIGHLIFE_ARRANGEMENT.has_existing_percussion
   );
   const [tracks, setTracks] = useState<PercussionTrack[]>(() =>
     hydrateTracksWithFallbackSamples(INITIAL_HIGHLIFE_ARRANGEMENT.tracks)
@@ -82,19 +120,28 @@ export default function App() {
 
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [originalPeaks, setOriginalPeaks] = useState<number[]>([]);
+  const [hasPlayableOriginal, setHasPlayableOriginal] = useState(false);
   const [analysisStatus, setAnalysisStatus] = useState<AnalysisStatus>('idle');
   const [analysisError, setAnalysisError] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] =
-    useState<GeminiAnalysisModel>('gemini-2.5-flash');
 
   const [freesoundKey, setFreesoundKey] = useState('');
   const [serverFreesoundConfigured, setServerFreesoundConfigured] = useState(false);
   const [isFreesoundModalOpen, setIsFreesoundModalOpen] = useState(false);
   const [swappingTrackId, setSwappingTrackId] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState(false);
-  const [exportMessage, setExportMessage] = useState<string | null>(null);
+  const [statusBanner, setStatusBanner] = useState<string | null>(null);
 
-  // Sync audio engine state on every change
+  // Tap Loop studio state
+  const [tapPads, setTapPads] = useState<TapPad[]>(() => createDefaultTapPads());
+  const [tapRecordArmed, setTapRecordArmed] = useState(true);
+  const [tapQuantize, setTapQuantize] = useState(false);
+  const [tapClickEnabled, setTapClickEnabled] = useState(false);
+  const [tapPhase, setTapPhase] = useState(-1);
+  const [tapPadError, setTapPadError] = useState<string | null>(null);
+  const [flashingPadIds, setFlashingPadIds] = useState<Record<string, number>>({});
+  const tapTempoHistoryRef = useRef<number[]>([]);
+  const flashTimersRef = useRef<Record<string, number>>({});
+
   useEffect(() => {
     engineRef.current?.updateState({
       bpm,
@@ -105,17 +152,50 @@ export default function App() {
   }, [bpm, loopBars, blendRatio, tracks]);
 
   useEffect(() => {
+    const mode = activePage === 'taploop' ? 'taploop' : 'sequencer';
+    engineRef.current?.updateTapLoopState({
+      mode,
+      tapPads,
+      tapClickEnabled,
+    });
+  }, [activePage, tapPads, tapClickEnabled]);
+
+  useEffect(() => {
+    if (activePage === 'taploop') {
+      void engineRef.current?.preloadTapPads(tapPads);
+    }
+  }, [activePage, tapPads]);
+
+  const triggerPadFlash = useCallback((padId: string) => {
+    setFlashingPadIds((prev) => ({ ...prev, [padId]: Date.now() }));
+    const existingTimer = flashTimersRef.current[padId];
+    if (existingTimer) window.clearTimeout(existingTimer);
+    flashTimersRef.current[padId] = window.setTimeout(() => {
+      setFlashingPadIds((prev) => {
+        const next = { ...prev };
+        delete next[padId];
+        return next;
+      });
+    }, 150);
+  }, []);
+
+  useEffect(() => {
     const engine = engineRef.current;
     if (!engine) return;
     engine.setOnStep((step) => {
       setCurrentStep(step);
     });
+    engine.setOnTapPhase((phase) => {
+      setTapPhase(phase);
+    });
+    engine.setOnTapPadTrigger((padId) => {
+      triggerPadFlash(padId);
+    });
     return () => {
       engine.stop();
     };
-  }, []);
+  }, [triggerPadFlash]);
 
-  // Check if server already has FREESOUND_API_KEY configured
   useEffect(() => {
     fetch('/api/health')
       .then((res) => (res.ok ? res.json() : null))
@@ -175,24 +255,179 @@ export default function App() {
       engine.stop();
       setIsPlaying(false);
       setCurrentStep(-1);
+      setTapPhase(-1);
     } else {
       setIsPlaying(true);
       await engine.start();
     }
   }, [isPlaying]);
 
-  // Global Spacebar transport shortcut
+  const handleSelectPage = useCallback(
+    (nextPage: StudioPage) => {
+      const wasTapLoop = activePage === 'taploop';
+      const willBeTapLoop = nextPage === 'taploop';
+      if (wasTapLoop !== willBeTapLoop && isPlaying) {
+        engineRef.current?.stop();
+        setIsPlaying(false);
+        setCurrentStep(-1);
+        setTapPhase(-1);
+      }
+      setActivePage(nextPage);
+    },
+    [activePage, isPlaying]
+  );
+
+  const handlePadTap = useCallback(
+    async (padId: string) => {
+      const engine = engineRef.current;
+      const pad = tapPads.find((p) => p.id === padId);
+      if (!engine || !pad) return;
+
+      triggerPadFlash(padId);
+      setTapPadError(null);
+
+      const { tapCtxTime, wasPlaying, elapsedInCycle, loopDuration } =
+        await engine.triggerTapPadNow(pad, 96);
+
+      if (!tapRecordArmed) return;
+
+      const phase = wasPlaying
+        ? computeTapPhase(elapsedInCycle, loopDuration, tapQuantize, loopBars)
+        : 0;
+
+      const newEvent = {
+        id: `tap-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        phase,
+        velocity: 96,
+        skipUntilCtxTime: tapCtxTime + Math.min(0.28, loopDuration * 0.4),
+      };
+
+      const nextPads = tapPads.map((p) =>
+        p.id === padId ? { ...p, events: [...p.events, newEvent] } : p
+      );
+
+      setTapPads(nextPads);
+      engine.updateTapLoopState({
+        mode: 'taploop',
+        tapPads: nextPads,
+        tapClickEnabled,
+      });
+
+      if (!wasPlaying) {
+        setIsPlaying(true);
+        await engine.startTapLoopFromTap(tapCtxTime);
+      }
+    },
+    [tapPads, tapRecordArmed, tapQuantize, loopBars, tapClickEnabled, triggerPadFlash]
+  );
+
+  const handleAddTapPad = () => {
+    setTapPads((prev) => [...prev, createNextTapPad(prev.length)]);
+  };
+
+  const handleRemoveTapPad = (padId: string) => {
+    setTapPads((prev) => (prev.length > 6 ? prev.filter((p) => p.id !== padId) : prev));
+  };
+
+  const handleSelectTapPreset = (padId: string, preset: TapPresetOption) => {
+    setTapPads((prev) =>
+      prev.map((p) =>
+        p.id === padId
+          ? {
+              ...p,
+              name: preset.label,
+              category: preset.category,
+              accentColor: preset.accentColor,
+              sample: preset.sample,
+              customFileName: undefined,
+            }
+          : p
+      )
+    );
+  };
+
+  const handleReplaceTapPadFile = async (padId: string, file: File) => {
+    if (file.size > 15 * 1024 * 1024) {
+      setTapPadError('Pad audio file must be under 15 MB.');
+      return;
+    }
+    setTapPadError(null);
+    try {
+      const sample = await engineRef.current!.loadTapPadFile(padId, file);
+      setTapPads((prev) =>
+        prev.map((p) =>
+          p.id === padId
+            ? {
+                ...p,
+                name: sample.name,
+                category: 'Phone Audio',
+                customFileName: file.name,
+                sample,
+              }
+            : p
+        )
+      );
+      setStatusBanner(`Loaded "${file.name}" onto pad`);
+      window.setTimeout(() => setStatusBanner(null), 2500);
+    } catch (err) {
+      setTapPadError(
+        err instanceof Error ? err.message : 'Unable to load audio file onto pad.'
+      );
+    }
+  };
+
+  const handleToggleTapPadMute = (padId: string) => {
+    setTapPads((prev) =>
+      prev.map((p) => (p.id === padId ? { ...p, muted: !p.muted } : p))
+    );
+  };
+
+  const handleClearTapPadEvents = (padId: string) => {
+    setTapPads((prev) =>
+      prev.map((p) => (p.id === padId ? { ...p, events: [] } : p))
+    );
+  };
+
+  const handleClearAllTapLoops = () => {
+    setTapPads((prev) => prev.map((p) => ({ ...p, events: [] })));
+  };
+
+  const handleTapTempo = () => {
+    const now = performance.now();
+    const history = [...tapTempoHistoryRef.current, now].slice(-6);
+    tapTempoHistoryRef.current = history;
+    const detected = estimateBpmFromTapIntervals(history);
+    if (detected !== null) {
+      setBpm(detected);
+    }
+  };
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.code !== 'Space') return;
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      e.preventDefault();
-      void handleTogglePlay();
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        void handleTogglePlay();
+        return;
+      }
+
+      if (activePage === 'taploop' && !e.repeat) {
+        const digitMatch = /^Digit([1-9])$/.exec(e.code);
+        if (digitMatch) {
+          const padIdx = Number(digitMatch[1]) - 1;
+          const targetPad = tapPads[padIdx];
+          if (targetPad) {
+            e.preventDefault();
+            void handlePadTap(targetPad.id);
+          }
+        }
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleTogglePlay]);
+  }, [handleTogglePlay, activePage, tapPads, handlePadTap]);
 
   const handleFileSelected = async (file: File) => {
     if (file.size > 20 * 1024 * 1024) {
@@ -201,17 +436,25 @@ export default function App() {
       return;
     }
     setUploadedFile(file);
+    setOriginalPeaks([]);
+    setHasPlayableOriginal(false);
     setAnalysisStatus('idle');
     setAnalysisError(null);
 
     try {
-      const arrayBuf = await file.arrayBuffer();
-      const decoded = await engineRef.current!.decodeUploadedAudio(arrayBuf);
-      setOriginalPeaks(extractWaveformPeaks(decoded));
-      setBlendRatio(0.35);
+      const result = await engineRef.current!.loadUploadedFile(file);
+      if (result.buffer) {
+        setOriginalPeaks(extractWaveformPeaks(result.buffer));
+        setHasPlayableOriginal(true);
+        setBlendRatio(0.35);
+      } else if (result.playableViaElement) {
+        setHasPlayableOriginal(true);
+        setBlendRatio(0.35);
+      } else {
+        setBlendRatio(0);
+      }
     } catch {
-      setAnalysisStatus('error');
-      setAnalysisError('Could not decode audio file in browser. Please try WAV, MP3, or M4A.');
+      setBlendRatio(0);
     }
   };
 
@@ -219,12 +462,13 @@ export default function App() {
     engineRef.current?.clearUploadedAudio();
     setUploadedFile(null);
     setOriginalPeaks([]);
+    setHasPlayableOriginal(false);
     setAnalysisStatus('idle');
     setAnalysisError(null);
     setBlendRatio(0);
   };
 
-  const handleAnalyzeAudio = async () => {
+  const handleAnalyzeAudio = async (mode: AnalysisMode) => {
     if (!uploadedFile) return;
     setAnalysisStatus('analyzing');
     setAnalysisError(null);
@@ -238,9 +482,10 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           audioBase64,
-          mimeType: uploadedFile.type || 'audio/mpeg',
+          mimeType: inferAudioMimeType(uploadedFile),
           fileName: uploadedFile.name,
-          model: selectedModel,
+          analysisMode: mode,
+          targetGroove: mode === 'compose' ? targetGroove : undefined,
         }),
       });
 
@@ -250,13 +495,19 @@ export default function App() {
       }
 
       const hydrated = hydrateTracksWithFallbackSamples(payload.tracks);
-      setBpm(clampBpm(payload.detected_bpm));
+      const nextBpm = clampBpm(payload.detected_bpm);
+      setBpm(nextBpm);
       setGrooveStyle(payload.groove_style);
       setTimeSignature(payload.time_signature);
-      setHasExistingPercussion(payload.has_existing_percussion);
       setTracks(hydrated);
       setActiveBar(0);
       setAnalysisStatus('ready');
+      setStatusBanner(
+        mode === 'compose'
+          ? `Composed ${payload.groove_style} (${nextBpm} BPM) for ${uploadedFile.name}`
+          : `Extracted ${payload.groove_style} (${nextBpm} BPM) from ${uploadedFile.name}`
+      );
+      setActivePage('sequencer');
 
       void engineRef.current?.preloadTracks(hydrated);
       if (freesoundKey || serverFreesoundConfigured) {
@@ -326,7 +577,6 @@ export default function App() {
     try {
       let candidates = target.samples ?? [];
 
-      // If Freesound key is active and we haven't pulled Freesound results yet for this track
       const hasFreesoundAlready = candidates.some((s) => s.source === 'freesound');
       if (
         !target.isClick &&
@@ -369,34 +619,43 @@ export default function App() {
   const handleExportWav = async () => {
     if (!engineRef.current || isExporting) return;
     setIsExporting(true);
-    setExportMessage(null);
+    setStatusBanner(null);
     try {
+      const isTapExport = activePage === 'taploop';
       const wavBlob = await engineRef.current.exportWavWithClick({
         bpm,
         loopBars,
         tracks,
         blendRatio,
+        tapPads,
+        exportTapLoop: isTapExport,
       });
       const url = URL.createObjectURL(wavBlob);
       const a = document.createElement('a');
-      const slug = grooveStyle.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+      const slug = isTapExport
+        ? 'tap-loop'
+        : grooveStyle.toLowerCase().replace(/[^a-z0-9]+/g, '-');
       a.href = url;
       a.download = `praiseloop-${slug}-${bpm}bpm-${loopBars}bars-click.wav`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      setExportMessage(`Exported ${loopBars}-bar ${bpm} BPM WAV + Click`);
-      window.setTimeout(() => setExportMessage(null), 3500);
+      setStatusBanner(
+        isTapExport
+          ? `Exported Tap Loop ${loopBars}-bar ${bpm} BPM WAV + Click`
+          : `Exported ${loopBars}-bar ${bpm} BPM WAV + Click`
+      );
+      window.setTimeout(() => setStatusBanner(null), 3500);
     } catch {
-      setExportMessage('WAV export failed. Check sample state and retry.');
+      setStatusBanner('WAV export failed. Check sample state and retry.');
     } finally {
       setIsExporting(false);
     }
   };
 
   return (
-    <div className="min-h-screen bg-[#09090B] text-zinc-100 pb-28">
+    <div className="min-h-screen overflow-x-hidden bg-[#09090B] text-zinc-100 pb-32">
       <StudioHeader
         bpm={bpm}
         onBpmChange={setBpm}
@@ -409,60 +668,109 @@ export default function App() {
         isExporting={isExporting}
       />
 
-      <main className="mx-auto max-w-[1440px] space-y-5 px-4 pt-5 sm:px-6">
-        {exportMessage && (
+      <main className="mx-auto max-w-[1440px] space-y-4 px-3 pt-4 sm:space-y-5 sm:px-6 sm:pt-5">
+        {statusBanner && (
           <div
             role="status"
-            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs font-medium text-amber-300"
+            className="flex items-center justify-between gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-2 text-xs font-medium text-amber-300"
           >
-            {exportMessage}
+            <span>{statusBanner}</span>
+            <button
+              type="button"
+              onClick={() => setStatusBanner(null)}
+              className="shrink-0 text-amber-200 hover:text-white"
+            >
+              Dismiss
+            </button>
           </div>
         )}
 
-        <WaveformDropzone
-          uploadedFileName={uploadedFile?.name ?? null}
-          originalPeaks={originalPeaks}
-          tracks={tracks}
-          currentStep={currentStep}
-          loopBars={loopBars}
-          analysisStatus={analysisStatus}
-          analysisError={analysisError}
-          hasExistingPercussion={hasExistingPercussion}
-          selectedModel={selectedModel}
-          onSelectModel={setSelectedModel}
-          onFileSelected={handleFileSelected}
-          onAnalyzeAudio={handleAnalyzeAudio}
-          onClearAudio={handleClearAudio}
-        />
+        {(activePage === 'compose' || activePage === 'extract') && (
+          <WaveformDropzone
+            mode={activePage}
+            targetGroove={targetGroove}
+            onTargetGrooveChange={setTargetGroove}
+            uploadedFileName={uploadedFile?.name ?? null}
+            originalPeaks={originalPeaks}
+            hasPlayableOriginal={hasPlayableOriginal}
+            tracks={tracks}
+            currentStep={currentStep}
+            loopBars={loopBars}
+            analysisStatus={analysisStatus}
+            analysisError={analysisError}
+            onFileSelected={handleFileSelected}
+            onAnalyzeAudio={handleAnalyzeAudio}
+            onClearAudio={handleClearAudio}
+            onOpenSequencer={() => setActivePage('sequencer')}
+          />
+        )}
 
-        <SequencerMatrix
-          tracks={tracks}
-          activeBar={activeBar}
-          onSelectBar={(bar) => {
-            setFollowPlayhead(false);
-            setActiveBar(bar);
-          }}
-          followPlayhead={followPlayhead}
-          onToggleFollowPlayhead={() => setFollowPlayhead((f) => !f)}
-          loopBars={loopBars}
-          currentStep={currentStep}
-          swappingTrackId={swappingTrackId}
-          onToggleStep={handleToggleStep}
-          onToggleMute={handleToggleMute}
-          onToggleSolo={handleToggleSolo}
-          onVolumeChange={handleVolumeChange}
-          onPanChange={handlePanChange}
-          onSwapSample={handleSwapSample}
-          onPreviewTrack={(track) => {
-            void engineRef.current?.triggerPreview(track);
-          }}
-        />
+        {activePage === 'taploop' && (
+          <TapLoopStudio
+            pads={tapPads}
+            bpm={bpm}
+            loopBars={loopBars}
+            isPlaying={isPlaying}
+            tapPhase={tapPhase}
+            recordArmed={tapRecordArmed}
+            quantize={tapQuantize}
+            clickEnabled={tapClickEnabled}
+            flashingPadIds={flashingPadIds}
+            padError={tapPadError}
+            onToggleRecordArmed={() => setTapRecordArmed((v) => !v)}
+            onToggleQuantize={() => setTapQuantize((v) => !v)}
+            onToggleClick={() => setTapClickEnabled((v) => !v)}
+            onTapTempo={handleTapTempo}
+            onPadTap={(padId) => void handlePadTap(padId)}
+            onAddPad={handleAddTapPad}
+            onRemovePad={handleRemoveTapPad}
+            onSelectPreset={handleSelectTapPreset}
+            onReplacePadFile={(padId, file) => void handleReplaceTapPadFile(padId, file)}
+            onTogglePadMute={handleToggleTapPadMute}
+            onClearPadEvents={handleClearTapPadEvents}
+            onClearAllPads={handleClearAllTapLoops}
+          />
+        )}
+
+        {activePage === 'sequencer' && (
+          <SequencerMatrix
+            tracks={tracks}
+            activeBar={activeBar}
+            onSelectBar={(bar) => {
+              setFollowPlayhead(false);
+              setActiveBar(bar);
+            }}
+            followPlayhead={followPlayhead}
+            onToggleFollowPlayhead={() => setFollowPlayhead((f) => !f)}
+            loopBars={loopBars}
+            currentStep={currentStep}
+            swappingTrackId={swappingTrackId}
+            onToggleStep={handleToggleStep}
+            onToggleMute={handleToggleMute}
+            onToggleSolo={handleToggleSolo}
+            onVolumeChange={handleVolumeChange}
+            onPanChange={handlePanChange}
+            onSwapSample={handleSwapSample}
+            onPreviewTrack={(track) => {
+              void engineRef.current?.triggerPreview(track);
+            }}
+          />
+        )}
       </main>
 
-      <TransportDock
+      <BottomDock
+        activePage={activePage}
+        onSelectPage={handleSelectPage}
         isPlaying={isPlaying}
         onTogglePlay={() => void handleTogglePlay()}
         currentStep={currentStep}
+        customStepDisplay={
+          activePage === 'taploop'
+            ? tapPhase >= 0
+              ? phaseToBarBeatStep(tapPhase, loopBars)
+              : '01.1.1'
+            : null
+        }
         loopBars={loopBars}
         onLoopBarsChange={(bars) => {
           setLoopBars(bars);
@@ -470,7 +778,7 @@ export default function App() {
         }}
         blendRatio={blendRatio}
         onBlendChange={setBlendRatio}
-        hasOriginalAudio={Boolean(uploadedFile)}
+        hasOriginalAudio={hasPlayableOriginal}
       />
 
       <FreesoundModal

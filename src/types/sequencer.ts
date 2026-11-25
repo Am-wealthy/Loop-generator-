@@ -1,10 +1,14 @@
 export type LoopBars = 1 | 2 | 4;
 
+export type StudioPage = 'compose' | 'extract' | 'taploop' | 'sequencer';
+
+export type AnalysisMode = 'compose' | 'extract';
+
 export interface SampleCandidate {
   id: string;
   name: string;
   url: string;
-  source: 'freesound' | 'cdn' | 'synth';
+  source: 'freesound' | 'cdn' | 'synth' | 'custom';
 }
 
 export interface PercussionTrack {
@@ -31,4 +35,29 @@ export interface ArrangementBlueprint {
 
 export type AnalysisStatus = 'idle' | 'analyzing' | 'ready' | 'error';
 
-export type GeminiAnalysisModel = 'gemini-2.5-flash' | 'gemini-2.5-pro';
+export interface TapLoopEvent {
+  id: string;
+  phase: number; // Normalized [0, 1) position inside the active loop cycle
+  velocity: number; // 1-100
+  skipUntilCtxTime?: number; // Prevents same-pass double trigger on live tap
+}
+
+export interface TapPresetOption {
+  id: string;
+  label: string;
+  category: string;
+  accentColor: 'amber' | 'emerald';
+  sample: SampleCandidate;
+}
+
+export interface TapPad {
+  id: string;
+  name: string;
+  category: string;
+  accentColor: 'amber' | 'emerald';
+  sample: SampleCandidate;
+  customFileName?: string;
+  events: TapLoopEvent[];
+  muted: boolean;
+  volume_db: number;
+}

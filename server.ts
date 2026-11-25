@@ -43,8 +43,14 @@ const ALLOWED_AUDIO_MIMES = new Set([
   'audio/m4a',
   'audio/x-m4a',
   'audio/aac',
+  'audio/x-aac',
   'audio/webm',
   'audio/flac',
+  'audio/x-flac',
+  'audio/aiff',
+  'audio/x-aiff',
+  'audio/amr',
+  'audio/3gpp',
 ]);
 
 const ALLOWED_PROXY_HOSTS = new Set([
@@ -107,7 +113,7 @@ async function createServer() {
         return;
       }
 
-      const { audioBase64, mimeType, fileName, model } = req.body ?? {};
+      const { audioBase64, mimeType, fileName, analysisMode, targetGroove } = req.body ?? {};
       if (typeof audioBase64 !== 'string' || audioBase64.length < 100) {
         res.status(400).json({ error: 'A valid audio file payload is required.' });
         return;
@@ -121,19 +127,35 @@ async function createServer() {
         return;
       }
 
-      const normalizedMime =
-        typeof mimeType === 'string' && ALLOWED_AUDIO_MIMES.has(mimeType.toLowerCase())
-          ? mimeType.toLowerCase()
-          : 'audio/mpeg';
-
-      const selectedModel =
-        model === 'gemini-2.5-pro' ? 'gemini-2.5-pro' : 'gemini-2.5-flash';
+      const baseMime =
+        typeof mimeType === 'string'
+          ? mimeType.split(';')[0].trim().toLowerCase()
+          : '';
+      const mappedMime =
+        baseMime === 'video/mp4' || baseMime === 'audio/x-m4a' || baseMime === 'audio/m4a'
+          ? 'audio/mp4'
+          : baseMime === 'audio/x-aac'
+          ? 'audio/aac'
+          : baseMime === 'audio/x-flac'
+          ? 'audio/flac'
+          : baseMime;
+      const normalizedMime = ALLOWED_AUDIO_MIMES.has(mappedMime)
+        ? mappedMime
+        : 'audio/mpeg';
 
       const safeFileName =
         typeof fileName === 'string' ? fileName.slice(0, 120) : 'uploaded-audio';
+      const modeInstruction =
+        analysisMode === 'extract'
+          ? 'USER SELECTED MODE: CASE A (EXTRACT EXACT LOOP). This track already contains percussion/drums. Transcribe the exact rhythmic placement of every auxiliary percussion element used in the music across the 64-step grid (ignoring heavy kick drum), and set has_existing_percussion to true.'
+          : `USER SELECTED MODE: CASE B (COMPOSE PERCUSSION FOR DRUMLESS MUSIC). This recording needs a percussion loop generated for it. Compose an authentic, infectious Nigerian Afro-gospel percussion arrangement locked tightly into the vocal/keyboard rhythm${
+              typeof targetGroove === 'string' && targetGroove.trim() && targetGroove !== 'auto'
+                ? ` with a ${targetGroove.trim()} feel`
+                : ''
+            }, and set has_existing_percussion to false.`;
 
       const response = await ai.models.generateContent({
-        model: selectedModel,
+        model: 'gemini-4-hydrogen',
         contents: {
           parts: [
             {
@@ -143,7 +165,7 @@ async function createServer() {
               },
             },
             {
-              text: `Analyze this uploaded audio ("${safeFileName}") and produce the exact 4-bar (64-step) Afro-gospel percussion loop blueprint JSON, including synced click_hi and click_lo tracks.`,
+              text: `Analyze this uploaded audio ("${safeFileName}"). ${modeInstruction} Always include synced click_hi and click_lo tracks across the 64-step grid.`,
             },
           ],
         },

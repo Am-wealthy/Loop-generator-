@@ -1,0 +1,6 @@
+{
+  "name": "PRAISELOOP AI",
+  "description": "AI percussion extractor and generator for church keyboardists and music directors.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

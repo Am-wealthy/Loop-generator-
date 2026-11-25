@@ -9,6 +9,9 @@ export interface SampleCandidate {
   name: string;
   url: string;
   source: 'freesound' | 'cdn' | 'synth' | 'custom';
+  duration?: number;
+  username?: string;
+  tags?: string[];
 }
 
 export interface PercussionTrack {
@@ -63,4 +66,53 @@ export interface TapPad {
   muted: boolean;
   volume_db: number;
   reverb: number; // 0 .. 1 per-percussion reverb send
+}
+
+export type ExportFormat = 'wav-studio' | 'wav-compact';
+
+export interface ExportOptions {
+  durationMode: 'default' | 'minutes';
+  minutes: number; // 1 .. 15 when durationMode === 'minutes'
+  cutoffHz: number; // 180 .. 18000 Hz
+  resonanceQ: number; // 0.5 .. 8
+  reverbAmount: number; // 0 .. 1
+  reverbSize: ReverbRoomSize;
+  format: ExportFormat;
+  includeClick: boolean;
+  includeOriginalBlend: boolean;
+  normalizePeak: boolean;
+}
+
+export type VoiceActionType =
+  | 'set_groove_pattern'
+  | 'set_bpm'
+  | 'transport'
+  | 'set_metronome'
+  | 'set_loop_bars'
+  | 'navigate_page'
+  | 'mute_solo_track'
+  | 'set_fx'
+  | 'open_export';
+
+export interface VoiceAction {
+  type: VoiceActionType;
+  instrument_keyword?: string;
+  display_name?: string;
+  steps?: number[];
+  mode?: 'replace' | 'layer' | 'clear';
+  bpm?: number;
+  state?: 'play' | 'stop';
+  enabled?: boolean;
+  bars?: LoopBars;
+  page?: StudioPage;
+  muted?: boolean;
+  soloed?: boolean;
+  cutoffHz?: number;
+  masterReverb?: number;
+  durationMinutes?: number;
+}
+
+export interface VoiceCommandResponse {
+  spoken_summary: string;
+  actions: VoiceAction[];
 }

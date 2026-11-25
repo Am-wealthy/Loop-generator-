@@ -3,12 +3,15 @@ import assert from 'node:assert/strict';
 import {
   clampBpm,
   dbToGain,
+  encodeRepeatedStereoWavBlob,
   encodeStereoWav,
+  estimateExportSizeMb,
   formatBarBeatStep,
   getActiveStepCount,
   getStepDurationSeconds,
   isTrackAudible,
   matchFallbackCategory,
+  MAX_UPLOAD_DURATION_SECONDS,
   normalizeArrangement,
 } from './sequencerLogic';
 import { INITIAL_HIGHLIFE_ARRANGEMENT } from '../data/presets';
@@ -22,7 +25,7 @@ test('clampBpm enforces studio range 40-220', () => {
 
 test('dbToGain converts dB to linear gain cleanly', () => {
   assert.equal(Math.round(dbToGain(0) * 1000) / 1000, 1);
-  assert.equal(Math.round(dbToGain(-6) * 100) / 100, 0.5);
+  assert.equal(Math.round(dbToGain(-6) * 1000) / 1000, 0.501);
   assert.equal(dbToGain(-60), 0);
 });
 
@@ -96,4 +99,20 @@ test('encodeStereoWav writes valid RIFF WAVE header and PCM samples', () => {
   assert.equal(String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11)), 'WAVE');
   assert.equal(view.getUint32(24, true), 44100);
   assert.equal(view.getUint16(22, true), 2);
+});
+
+test('encodeRepeatedStereoWavBlob tiles cycle PCM cleanly for multi-minute exports', async () => {
+  assert.equal(MAX_UPLOAD_DURATION_SECONDS, 300);
+  const sr = 22050;
+  const cycleFrames = sr; // 1 second cycle
+  const left = new Float32Array(cycleFrames).fill(0.25);
+  const right = new Float32Array(cycleFrames).fill(-0.25);
+
+  const blob = encodeRepeatedStereoWavBlob(left, right, sr, 5.5, true);
+  assert.equal(blob.size, 44 + Math.round(5.5 * sr) * 4);
+  const headerBuf = await blob.slice(0, 44).arrayBuffer();
+  const hv = new DataView(headerBuf);
+  assert.equal(hv.getUint32(24, true), sr);
+  assert.equal(hv.getUint32(40, true), Math.round(5.5 * sr) * 4);
+  assert.ok(estimateExportSizeMb(60, 44100) > 10);
 });

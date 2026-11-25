@@ -1,77 +1,153 @@
 import React, { useRef } from 'react';
-import { clampPan } from '../utils/sequencerLogic';
 
 interface RotaryKnobProps {
-  value: number; // -1 to 1
-  onChange: (nextValue: number) => void;
   label: string;
+  valueLabel: string;
+  subLabel?: string;
+  ratio: number; // 0 .. 1
+  onChangeRatio: (nextRatio: number) => void;
+  accent?: 'amber' | 'emerald';
+  ariaLabel: string;
+  ariaValueText?: string;
 }
 
-export const RotaryKnob: React.FC<RotaryKnobProps> = ({ value, onChange, label }) => {
-  const startY = useRef<number | null>(null);
-  const startVal = useRef<number>(value);
+export const RotaryKnob: React.FC<RotaryKnobProps> = ({
+  label,
+  valueLabel,
+  subLabel,
+  ratio,
+  onChangeRatio,
+  accent = 'amber',
+  ariaLabel,
+  ariaValueText,
+}) => {
+  const clamped = Math.max(0, Math.min(1, ratio));
+  const dragRef = useRef<{ y: number; x: number; startRatio: number } | null>(null);
 
-  const angle = value * 135; // -135deg to +135deg
+  // Arc from -135 deg to +135 deg (270 deg sweep)
+  const startAngle = -135;
+  const endAngle = 135;
+  const currentAngle = startAngle + clamped * (endAngle - startAngle);
 
-  const handlePointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
-    startY.current = e.clientY;
-    startVal.current = value;
-    e.currentTarget.setPointerCapture(e.pointerId);
+  const polarToCartesian = (cx: number, cy: number, r: number, angleDeg: number) => {
+    const rad = ((angleDeg - 90) * Math.PI) / 180;
+    return {
+      x: cx + r * Math.cos(rad),
+      y: cy + r * Math.sin(rad),
+    };
   };
 
-  const handlePointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
-    if (startY.current === null) return;
-    const delta = (startY.current - e.clientY) / 70;
-    onChange(clampPan(startVal.current + delta));
+  const describeArc = (
+    cx: number,
+    cy: number,
+    r: number,
+    fromDeg: number,
+    toDeg: number
+  ) => {
+    const start = polarToCartesian(cx, cy, r, fromDeg);
+    const end = polarToCartesian(cx, cy, r, toDeg);
+    const largeArc = Math.abs(toDeg - fromDeg) > 180 ? 1 : 0;
+    return `M ${start.x.toFixed(2)} ${start.y.toFixed(2)} A ${r} ${r} 0 ${largeArc} 1 ${end.x.toFixed(
+      2
+    )} ${end.y.toFixed(2)}`;
   };
 
-  const handlePointerUp = () => {
-    startY.current = null;
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
-      e.preventDefault();
-      onChange(clampPan(value - 0.1));
-    } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
-      e.preventDefault();
-      onChange(clampPan(value + 0.1));
-    }
-  };
-
-  const panText =
-    Math.abs(value) < 0.05
-      ? 'C'
-      : value < 0
-      ? `L${Math.round(Math.abs(value) * 100)}`
-      : `R${Math.round(value * 100)}`;
+  const pointerPos = polarToCartesian(44, 44, 20, currentAngle);
+  const strokeColor = accent === 'emerald' ? '#10B981' : '#F59E0B';
 
   return (
-    <div className="flex flex-col items-center gap-0.5">
-      <button
-        type="button"
+    <div className="flex flex-col items-center gap-1.5 rounded-xl border border-zinc-800 bg-zinc-950/90 p-3 text-center">
+      <span className="text-[11px] font-bold uppercase tracking-wider text-zinc-300">
+        {label}
+      </span>
+
+      <div
         role="slider"
-        aria-label={label}
-        aria-valuemin={-1}
-        aria-valuemax={1}
-        aria-valuenow={value}
-        aria-valuetext={panText}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onDoubleClick={() => onChange(0)}
-        onKeyDown={handleKeyDown}
-        title="Drag vertically to pan, double-click to center"
-        className="relative flex h-8 w-8 cursor-ns-resize items-center justify-center rounded-full border border-zinc-700 bg-gradient-to-b from-zinc-800 to-zinc-950 shadow-[inset_0_1px_1px_rgba(255,255,255,0.12),0_2px_4px_rgba(0,0,0,0.6)] focus-visible:outline-2 focus-visible:outline-amber-500"
+        tabIndex={0}
+        aria-label={ariaLabel}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(clamped * 100)}
+        aria-valuetext={ariaValueText ?? valueLabel}
+        onPointerDown={(e) => {
+          e.preventDefault();
+          dragRef.current = { y: e.clientY, x: e.clientX, startRatio: clamped };
+          e.currentTarget.setPointerCapture(e.pointerId);
+        }}
+        onPointerMove={(e) => {
+          if (!dragRef.current) return;
+          const dy = dragRef.current.y - e.clientY;
+          const dx = e.clientX - dragRef.current.x;
+          const delta = (dy + dx * 0.5) / 140;
+          onChangeRatio(Math.max(0, Math.min(1, dragRef.current.startRatio + delta)));
+        }}
+        onPointerUp={() => {
+          dragRef.current = null;
+        }}
+        onPointerCancel={() => {
+          dragRef.current = null;
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
+            e.preventDefault();
+            onChangeRatio(Math.min(1, clamped + 0.05));
+          } else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') {
+            e.preventDefault();
+            onChangeRatio(Math.max(0, clamped - 0.05));
+          }
+        }}
+        title="Drag up/down or use arrow keys to turn knob"
+        className="relative cursor-ns-resize select-none touch-none rounded-full focus-visible:outline-2 focus-visible:outline-amber-400"
       >
-        <span
-          className="block h-full w-full"
-          style={{ transform: `rotate(${angle}deg)` }}
-        >
-          <span className="mx-auto mt-1 block h-2.5 w-0.5 rounded-full bg-amber-400 shadow-[0_0_6px_rgba(245,158,11,0.8)]" />
-        </span>
-      </button>
-      <span className="font-mono-tabular text-[10px] text-zinc-400">{panText}</span>
+        <svg viewBox="0 0 88 88" className="h-20 w-20">
+          {/* Track Arc */}
+          <path
+            d={describeArc(44, 44, 34, startAngle, endAngle)}
+            fill="none"
+            stroke="#27272A"
+            strokeWidth="5"
+            strokeLinecap="round"
+          />
+          {/* Active Value Arc */}
+          {clamped > 0.01 && (
+            <path
+              d={describeArc(44, 44, 34, startAngle, currentAngle)}
+              fill="none"
+              stroke={strokeColor}
+              strokeWidth="5"
+              strokeLinecap="round"
+            />
+          )}
+          {/* Inner Brushed Dial Cap */}
+          <circle
+            cx="44"
+            cy="44"
+            r="25"
+            fill="#141419"
+            stroke="#3F3F46"
+            strokeWidth="1.5"
+          />
+          <circle cx="44" cy="44" r="19" fill="#0D0D11" />
+          {/* Dial Indicator Dot */}
+          <line
+            x1="44"
+            y1="44"
+            x2={pointerPos.x}
+            y2={pointerPos.y}
+            stroke={strokeColor}
+            strokeWidth="2.5"
+            strokeLinecap="round"
+          />
+          <circle cx={pointerPos.x} cy={pointerPos.y} r="2.5" fill={strokeColor} />
+        </svg>
+      </div>
+
+      <span className="font-mono-tabular rounded border border-zinc-800 bg-zinc-900 px-2 py-0.5 text-xs font-bold text-zinc-100">
+        {valueLabel}
+      </span>
+      {subLabel && (
+        <span className="text-[10px] text-zinc-400">{subLabel}</span>
+      )}
     </div>
   );
 };

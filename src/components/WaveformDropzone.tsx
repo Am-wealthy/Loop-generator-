@@ -18,6 +18,8 @@ interface WaveformDropzoneProps {
   targetGroove: string;
   onTargetGrooveChange: (groove: string) => void;
   uploadedFileName: string | null;
+  uploadedDurationSec: number;
+  wasTrimmedToFiveMin: boolean;
   originalPeaks: number[];
   hasPlayableOriginal: boolean;
   tracks: PercussionTrack[];
@@ -44,6 +46,8 @@ export const WaveformDropzone: React.FC<WaveformDropzoneProps> = ({
   targetGroove,
   onTargetGrooveChange,
   uploadedFileName,
+  uploadedDurationSec,
+  wasTrimmedToFiveMin,
   originalPeaks,
   hasPlayableOriginal,
   tracks,
@@ -308,9 +312,21 @@ export const WaveformDropzone: React.FC<WaveformDropzoneProps> = ({
                   <p className="mt-1 text-xs leading-relaxed text-zinc-400">
                     {uploadedFileName
                       ? isCompose
-                        ? 'Loaded. Click Generate Percussion Loop to build a groove locked to your timing.'
-                        : 'Loaded. Click Extract Exact Song Loop to transcribe its percussion pockets.'
-                      : 'Supports MP3, WAV, M4A, AAC, OGG, and FLAC up to 20 MB.'}
+                        ? `Loaded${
+                            uploadedDurationSec > 0
+                              ? ` (${Math.floor(uploadedDurationSec / 60)}:${String(
+                                  Math.round(uploadedDurationSec % 60)
+                                ).padStart(2, '0')})`
+                              : ''
+                          }${wasTrimmedToFiveMin ? ' · Cut to 5:00 max' : ''}. Click Generate Percussion Loop.`
+                        : `Loaded${
+                            uploadedDurationSec > 0
+                              ? ` (${Math.floor(uploadedDurationSec / 60)}:${String(
+                                  Math.round(uploadedDurationSec % 60)
+                                ).padStart(2, '0')})`
+                              : ''
+                          }${wasTrimmedToFiveMin ? ' · Cut to 5:00 max' : ''}. Click Extract Exact Song Loop.`
+                      : 'Supports MP3, WAV, M4A, AAC, OGG, and FLAC (auto-cut to 5:00 max).'}
                   </p>
                 </div>
               </div>
@@ -422,7 +438,9 @@ export const WaveformDropzone: React.FC<WaveformDropzoneProps> = ({
                 </span>
                 <span className="font-mono-tabular shrink-0 text-zinc-500">
                   {uploadedFileName
-                    ? originalPeaks.length > 0
+                    ? wasTrimmedToFiveMin
+                      ? '5:00 MAX TRIMMED'
+                      : originalPeaks.length > 0
                       ? 'WAVEFORM READY'
                       : hasPlayableOriginal
                       ? 'LIVE BLEND READY'

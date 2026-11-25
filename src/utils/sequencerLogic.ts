@@ -259,3 +259,86 @@ export function encodeStereoWav(
 
   return buffer;
 }
+
+export const MAX_UPLOAD_DURATION_SECONDS = 300; // 5 minutes max
+
+export function estimateExportSizeMb(
+  durationSeconds: number,
+  sampleRate: number
+): number {
+  const bytes = 44 + Math.max(1, Math.round(durationSeconds * sampleRate)) * 4;
+  return Number((bytes / (1024 * 1024)).toFixed(1));
+}
+
+/**
+ * Encodes one seamless loop cycle into 16-bit PCM bytes once, then streams
+ * repeated references into a multi-minute WAV Blob without duplicating huge Float32 buffers.
+ */
+export function encodeRepeatedStereoWavBlob(
+  cycleLeft: Float32Array,
+  cycleRight: Float32Array,
+  sampleRate: number,
+  targetDurationSeconds: number,
+  normalizePeak = false
+): Blob {
+  const cycleFrames = Math.max(1, Math.min(cycleLeft.length, cycleRight.length));
+  const desiredFrames = Math.max(
+    cycleFrames,
+    Math.round(Math.max(0.25, targetDurationSeconds) * sampleRate)
+  );
+
+  let peakGain = 1;
+  if (normalizePeak) {
+    let maxAbs = 0.0001;
+    for (let i = 0; i < cycleFrames; i++) {
+      const aL = Math.abs(cycleLeft[i] ?? 0);
+      const aR = Math.abs(cycleRight[i] ?? 0);
+      if (aL > maxAbs) maxAbs = aL;
+      if (aR > maxAbs) maxAbs = aR;
+    }
+    if (maxAbs > 0.01) {
+      peakGain = Math.min(4, 0.94 / maxAbs);
+    }
+  }
+
+  const cycleBytes = new Uint8Array(cycleFrames * 4);
+  const cycleView = new DataView(cycleBytes.buffer);
+  for (let i = 0; i < cycleFrames; i++) {
+    const l = Math.max(-1, Math.min(1, (cycleLeft[i] ?? 0) * peakGain));
+    const r = Math.max(-1, Math.min(1, (cycleRight[i] ?? 0) * peakGain));
+    cycleView.setInt16(i * 4, l < 0 ? l * 0x8000 : l * 0x7fff, true);
+    cycleView.setInt16(i * 4 + 2, r < 0 ? r * 0x8000 : r * 0x7fff, true);
+  }
+
+  const dataSize = desiredFrames * 4;
+  const header = new ArrayBuffer(44);
+  const hv = new DataView(header);
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) hv.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  hv.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  hv.setUint32(16, 16, true);
+  hv.setUint16(20, 1, true);
+  hv.setUint16(22, 2, true);
+  hv.setUint32(24, sampleRate, true);
+  hv.setUint32(28, sampleRate * 4, true);
+  hv.setUint16(32, 4, true);
+  hv.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  hv.setUint32(40, dataSize, true);
+
+  const parts: BlobPart[] = [header];
+  let remainingFrames = desiredFrames;
+  while (remainingFrames >= cycleFrames) {
+    parts.push(cycleBytes);
+    remainingFrames -= cycleFrames;
+  }
+  if (remainingFrames > 0) {
+    parts.push(cycleBytes.subarray(0, remainingFrames * 4));
+  }
+
+  return new Blob(parts, { type: 'audio/wav' });
+}

@@ -1,7 +1,6 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import { RefreshCw, Volume2 } from 'lucide-react';
 import type { LoopBars, PercussionTrack } from '../types/sequencer';
-import { RotaryKnob } from './RotaryKnob';
 
 interface SequencerMatrixProps {
   tracks: PercussionTrack[];
@@ -22,6 +21,67 @@ interface SequencerMatrixProps {
 }
 
 const STEP_LABELS = ['1', 'e', '&', 'a', '2', 'e', '&', 'a', '3', 'e', '&', 'a', '4', 'e', '&', 'a'];
+
+const PanKnob: React.FC<{
+  value: number;
+  onChange: (val: number) => void;
+  label: string;
+}> = ({ value, onChange, label }) => {
+  const dragRef = useRef<{ y: number; start: number } | null>(null);
+  const safeVal = Math.max(-1, Math.min(1, value));
+  const angleDeg = safeVal * 135;
+  const panText =
+    Math.abs(safeVal) < 0.05
+      ? 'C'
+      : safeVal < 0
+      ? `L${Math.round(Math.abs(safeVal) * 100)}`
+      : `R${Math.round(safeVal * 100)}`;
+
+  return (
+    <div className="flex flex-col items-center gap-0.5">
+      <div
+        role="slider"
+        tabIndex={0}
+        aria-label={label}
+        aria-valuemin={-100}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(safeVal * 100)}
+        aria-valuetext={panText}
+        onPointerDown={(e) => {
+          e.preventDefault();
+          dragRef.current = { y: e.clientY, start: safeVal };
+          e.currentTarget.setPointerCapture(e.pointerId);
+        }}
+        onPointerMove={(e) => {
+          if (!dragRef.current) return;
+          const delta = (dragRef.current.y - e.clientY) / 70;
+          onChange(Math.max(-1, Math.min(1, Number((dragRef.current.start + delta).toFixed(2)))));
+        }}
+        onPointerUp={() => {
+          dragRef.current = null;
+        }}
+        onDoubleClick={() => onChange(0)}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            onChange(Math.min(1, Number((safeVal + 0.1).toFixed(2))));
+          } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+            e.preventDefault();
+            onChange(Math.max(-1, Number((safeVal - 0.1).toFixed(2))));
+          }
+        }}
+        title="Drag to pan L/R · Double-click to center"
+        className="relative flex h-7 w-7 cursor-ns-resize select-none touch-none items-center justify-center rounded-full border border-zinc-700 bg-zinc-900 focus-visible:outline-2 focus-visible:outline-amber-400"
+      >
+        <div
+          className="h-3 w-0.5 origin-bottom rounded-full bg-amber-400"
+          style={{ transform: `rotate(${angleDeg}deg) translateY(-2px)` }}
+        />
+      </div>
+      <span className="font-mono-tabular text-[9px] leading-none text-zinc-500">{panText}</span>
+    </div>
+  );
+};
 
 export const SequencerMatrix: React.FC<SequencerMatrixProps> = ({
   tracks,
@@ -249,7 +309,7 @@ export const SequencerMatrix: React.FC<SequencerMatrixProps> = ({
                     </span>
                   </div>
 
-                  <RotaryKnob
+                  <PanKnob
                     value={track.pan}
                     onChange={(val) => onPanChange(track.instrument_id, val)}
                     label={`Pan for ${track.display_name}`}

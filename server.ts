@@ -90,6 +90,40 @@ function getGeminiClient() {
   });
 }
 
+function parseGeminiError(err: unknown): {
+  status: number;
+  message: string;
+  isTransient: boolean;
+  isDailyQuota: boolean;
+} {
+  const rawMsg = err instanceof Error ? err.message : String(err ?? 'Gemini request failed.');
+  let message = rawMsg;
+  let status = 500;
+  try {
+    const parsedErr = JSON.parse(rawMsg) as {
+      error?: { code?: number; message?: string; status?: string };
+    };
+    if (parsedErr?.error?.message) {
+      message = parsedErr.error.message;
+    }
+    if (typeof parsedErr?.error?.code === 'number') {
+      status = parsedErr.error.code;
+    }
+  } catch {
+    if (rawMsg.includes('503') || rawMsg.includes('UNAVAILABLE')) status = 503;
+    else if (rawMsg.includes('429') || rawMsg.includes('RESOURCE_EXHAUSTED')) status = 429;
+  }
+  const isDailyQuota =
+    rawMsg.includes('GenerateRequestsPerDay') || rawMsg.includes('per day limit exceeded');
+  const isTransient =
+    status === 503 ||
+    status === 429 ||
+    rawMsg.includes('UNAVAILABLE') ||
+    rawMsg.includes('RESOURCE_EXHAUSTED') ||
+    rawMsg.includes('high demand');
+  return { status, message, isTransient, isDailyQuota };
+}
+
 async function createServer() {
   const app = express();
   app.use(express.json({ limit: '35mb' }));
@@ -158,69 +192,105 @@ async function createServer() {
               : ''
           }, and set has_existing_percussion to false.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: normalizedMime,
-              data: audioBase64,
-            },
+    let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
+    let lastErr: unknown = null;
+    const attemptPlan = [
+      { model: 'gemini-4-hydrogen', delayMs: 0 },
+      { model: 'gemini-4-hydrogen', delayMs: 1200 },
+      { model: 'gemini-3.1-flash-lite', delayMs: 0 },
+    ];
+
+    for (const step of attemptPlan) {
+      if (step.delayMs > 0) {
+        await new Promise((r) => setTimeout(r, step.delayMs));
+      }
+      try {
+        response = await ai.models.generateContent({
+          model: step.model,
+          contents: {
+            parts: [
+              {
+                inlineData: {
+                  mimeType: normalizedMime,
+                  data: audioBase64,
+                },
+              },
+              {
+                text: `Analyze this uploaded audio ("${safeFileName}"). ${modeInstruction} Always include synced click_hi and click_lo tracks across the 64-step grid.`,
+              },
+            ],
           },
-          {
-            text: `Analyze this uploaded audio ("${safeFileName}"). ${modeInstruction} Always include synced click_hi and click_lo tracks across the 64-step grid.`,
-          },
-        ],
-      },
-      config: {
-        systemInstruction: SYSTEM_INSTRUCTION,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            detected_bpm: { type: Type.NUMBER },
-            groove_style: { type: Type.STRING },
-            time_signature: { type: Type.STRING },
-            has_existing_percussion: { type: Type.BOOLEAN },
-            tracks: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  instrument_id: { type: Type.STRING },
-                  display_name: { type: Type.STRING },
-                  sample_search_query: { type: Type.STRING },
-                  volume_db: { type: Type.NUMBER },
-                  pan: { type: Type.NUMBER },
-                  steps: {
-                    type: Type.ARRAY,
-                    items: { type: Type.INTEGER },
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                detected_bpm: { type: Type.NUMBER },
+                groove_style: { type: Type.STRING },
+                time_signature: { type: Type.STRING },
+                has_existing_percussion: { type: Type.BOOLEAN },
+                tracks: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      instrument_id: { type: Type.STRING },
+                      display_name: { type: Type.STRING },
+                      sample_search_query: { type: Type.STRING },
+                      volume_db: { type: Type.NUMBER },
+                      pan: { type: Type.NUMBER },
+                      steps: {
+                        type: Type.ARRAY,
+                        items: { type: Type.INTEGER },
+                      },
+                    },
+                    required: [
+                      'instrument_id',
+                      'display_name',
+                      'sample_search_query',
+                      'volume_db',
+                      'pan',
+                      'steps',
+                    ],
                   },
                 },
-                required: [
-                  'instrument_id',
-                  'display_name',
-                  'sample_search_query',
-                  'volume_db',
-                  'pan',
-                  'steps',
-                ],
               },
+              required: [
+                'detected_bpm',
+                'groove_style',
+                'time_signature',
+                'has_existing_percussion',
+                'tracks',
+              ],
             },
           },
-          required: [
-            'detected_bpm',
-            'groove_style',
-            'time_signature',
-            'has_existing_percussion',
-            'tracks',
-          ],
-        },
-      },
-    });
+        });
+        lastErr = null;
+        break;
+      } catch (err) {
+        lastErr = err;
+        const parsedErr = parseGeminiError(err);
+        if (!parsedErr.isTransient) {
+          break;
+        }
+        // Skip extra sleep on daily quota and jump straight to next model
+        if (parsedErr.isDailyQuota && step.model === 'gemini-4-hydrogen') {
+          continue;
+        }
+      }
+    }
 
-    const rawText = (response.text ?? '').trim();
+    if (lastErr || !response) {
+      const parsedErr = parseGeminiError(lastErr);
+      return { status: parsedErr.status, body: { error: parsedErr.message } };
+    }
+
+    const rawText = (response.text ?? '')
+      .trim()
+      .replace(/^```(?:json)?\s*/i, '')
+      .replace(/```$/i, '')
+      .trim();
     if (!rawText) {
       return { status: 502, body: { error: 'Gemini returned an empty analysis response.' } };
     }
@@ -281,6 +351,152 @@ async function createServer() {
     }
   });
 
+  app.post('/api/voice-command', async (req, res) => {
+    try {
+      const ai = getGeminiClient();
+      if (!ai) {
+        res.status(503).json({
+          error:
+            'Gemini API key is not configured on the server. Please add GEMINI_API_KEY in Settings > Secrets.',
+        });
+        return;
+      }
+
+      const { audioBase64, mimeType, commandText, context } = req.body ?? {};
+      const hasAudio = typeof audioBase64 === 'string' && audioBase64.length > 100;
+      const hasText = typeof commandText === 'string' && commandText.trim().length > 0;
+
+      if (!hasAudio && !hasText) {
+        res.status(400).json({ error: 'Please record a voice command or type a prompt.' });
+        return;
+      }
+
+      const ctxJson = JSON.stringify(context ?? {});
+      const voiceSystem = `You are the live AI Voice Studio Director inside PRAISELOOP AI (an Afro-gospel percussion sequencer & tap looper).
+Listen closely to the user's voice recording and/or text command and translate it into concrete studio actions.
+CRITICAL RHYTHM RULE:
+When the user speaks, claps, or vocalizes a rhythm (e.g., "use shakers and create this rhythm: ta ta ta... ta ta" or "boom chik chik"), analyze the exact syllable spacing and cadence in their voice/words and output a 16-step (1 bar) or 64-step (4 bars) velocity array (integers 0-100, where 0 = rest, 55-100 = hit) on the 16th-note grid (steps 0..15 represent: 1, e, &, a, 2, e, &, a, 3, e, &, a, 4, e, &, a).
+For example, "ta ta ta ... ta ta" maps clearly onto crisp rhythmic accents like [96, 0, 88, 0, 94, 0, 0, 0, 96, 0, 88, 0, 0, 0, 0, 0].
+You can control EVERYTHING in the studio using one or more actions:
+- set_groove_pattern: set or layer a rhythm on an instrument (shekere/shaker, wooden_agogo, conga_slap, conga_low_open, cowbell, tambourine, talking_drum, bass).
+- set_bpm: change tempo (40-220).
+- transport: state 'play' or 'stop'.
+- set_metronome: enabled true/false (switch metronome click on or off).
+- set_loop_bars: bars 1, 2, or 4.
+- navigate_page: 'compose' | 'extract' | 'taploop' | 'sequencer'.
+- mute_solo_track: mute or solo an instrument by keyword.
+- set_fx: adjust cutoffHz (180..18000) and/or masterReverb (0..1).
+- open_export: open the Export studio dialog (optionally with durationMinutes).
+
+Current Studio Context: ${ctxJson}
+Return ONLY valid JSON with spoken_summary and actions.`;
+
+      const parts: Array<{ inlineData?: { mimeType: string; data: string }; text?: string }> = [];
+      if (hasAudio) {
+        const cleanMime = String(mimeType || 'audio/webm').split(';')[0].trim() || 'audio/webm';
+        parts.push({
+          inlineData: {
+            mimeType: cleanMime,
+            data: audioBase64,
+          },
+        });
+      }
+      parts.push({
+        text: hasText
+          ? `User voice/text command: "${String(commandText).trim()}". Interpret both words and any vocalized rhythm and return studio actions.`
+          : 'Listen to the user audio command and any beatboxed/vocalized rhythm, then return exact PRAISELOOP AI studio actions.',
+      });
+
+      let response: Awaited<ReturnType<typeof ai.models.generateContent>> | null = null;
+      let lastErr: unknown = null;
+      const attemptPlan = [
+        { model: 'gemini-4-hydrogen', delayMs: 0 },
+        { model: 'gemini-3.1-flash-lite', delayMs: 0 },
+      ];
+
+      for (const step of attemptPlan) {
+        if (step.delayMs > 0) await new Promise((r) => setTimeout(r, step.delayMs));
+        try {
+          response = await ai.models.generateContent({
+            model: step.model,
+            contents: { parts },
+            config: {
+              systemInstruction: voiceSystem,
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  spoken_summary: { type: Type.STRING },
+                  actions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        type: { type: Type.STRING },
+                        instrument_keyword: { type: Type.STRING },
+                        display_name: { type: Type.STRING },
+                        steps: {
+                          type: Type.ARRAY,
+                          items: { type: Type.INTEGER },
+                        },
+                        mode: { type: Type.STRING },
+                        bpm: { type: Type.NUMBER },
+                        state: { type: Type.STRING },
+                        enabled: { type: Type.BOOLEAN },
+                        bars: { type: Type.INTEGER },
+                        page: { type: Type.STRING },
+                        muted: { type: Type.BOOLEAN },
+                        soloed: { type: Type.BOOLEAN },
+                        cutoffHz: { type: Type.NUMBER },
+                        masterReverb: { type: Type.NUMBER },
+                        durationMinutes: { type: Type.NUMBER },
+                      },
+                      required: ['type'],
+                    },
+                  },
+                },
+                required: ['spoken_summary', 'actions'],
+              },
+            },
+          });
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const parsedErr = parseGeminiError(err);
+          if (!parsedErr.isTransient) break;
+        }
+      }
+
+      if (lastErr || !response) {
+        const parsedErr = parseGeminiError(lastErr);
+        res.status(parsedErr.status).json({ error: parsedErr.message });
+        return;
+      }
+
+      const raw = (response.text ?? '')
+        .trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/```$/i, '')
+        .trim();
+      const parsed = JSON.parse(raw || '{}') as {
+        spoken_summary?: string;
+        actions?: unknown[];
+      };
+      res.json({
+        spoken_summary:
+          typeof parsed.spoken_summary === 'string' && parsed.spoken_summary.trim()
+            ? parsed.spoken_summary.trim()
+            : 'Applied voice command to studio.',
+        actions: Array.isArray(parsed.actions) ? parsed.actions : [],
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to process voice command.';
+      res.status(500).json({ error: message });
+    }
+  });
+
   app.get('/api/freesound/search', async (req, res) => {
     try {
       const query = String(req.query.q ?? '').trim();
@@ -288,6 +504,12 @@ async function createServer() {
         res.status(400).json({ error: 'Query parameter "q" is required.' });
         return;
       }
+
+      const mode = String(req.query.mode ?? 'oneshot').toLowerCase();
+      const isBrowse = mode === 'browse';
+      const page = Math.max(1, Math.min(20, Number(req.query.page ?? 1) || 1));
+      const pageSize = isBrowse ? 12 : 5;
+      const maxDur = isBrowse ? 30 : 1.5;
 
       const freesoundKey = (
         req.header('x-freesound-key') ||
@@ -299,15 +521,21 @@ async function createServer() {
         res.status(200).json({
           configured: false,
           results: [],
+          count: 0,
+          page,
         });
         return;
       }
 
       const apiUrl = new URL('https://freesound.org/apiv2/search/text/');
       apiUrl.searchParams.set('query', query);
-      apiUrl.searchParams.set('filter', 'duration:[0 TO 1.5]');
-      apiUrl.searchParams.set('fields', 'id,name,previews');
-      apiUrl.searchParams.set('page_size', '5');
+      apiUrl.searchParams.set('filter', `duration:[0 TO ${maxDur}]`);
+      apiUrl.searchParams.set(
+        'fields',
+        isBrowse ? 'id,name,duration,username,tags,previews' : 'id,name,previews'
+      );
+      apiUrl.searchParams.set('page_size', String(pageSize));
+      apiUrl.searchParams.set('page', String(page));
 
       const upstream = await fetch(apiUrl.toString(), {
         headers: {
@@ -324,9 +552,13 @@ async function createServer() {
       }
 
       const data = (await upstream.json()) as {
+        count?: number;
         results?: Array<{
           id: number;
           name: string;
+          duration?: number;
+          username?: string;
+          tags?: string[];
           previews?: Record<string, string>;
         }>;
       };
@@ -344,13 +576,18 @@ async function createServer() {
             name: item.name,
             url: `/api/sample-proxy?url=${encodeURIComponent(previewUrl)}`,
             source: 'freesound' as const,
+            duration: typeof item.duration === 'number' ? item.duration : undefined,
+            username: typeof item.username === 'string' ? item.username : undefined,
+            tags: Array.isArray(item.tags) ? item.tags.slice(0, 4) : undefined,
           };
         })
         .filter((x): x is NonNullable<typeof x> => x !== null)
-        .slice(0, 5);
+        .slice(0, pageSize);
 
       res.json({
         configured: true,
+        count: typeof data.count === 'number' ? data.count : results.length,
+        page,
         results,
       });
     } catch (err) {

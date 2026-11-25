@@ -1,5 +1,5 @@
 import React from 'react';
-import { Disc3, Hand, Play, Sliders, Sparkles, Square } from 'lucide-react';
+import { Disc3, Hand, Play, Sliders, Sparkles, Square, Timer } from 'lucide-react';
 import type { LoopBars, StudioPage } from '../types/sequencer';
 import { formatBarBeatStep } from '../utils/sequencerLogic';
 
@@ -12,6 +12,8 @@ interface BottomDockProps {
   customStepDisplay?: string | null;
   loopBars: LoopBars;
   onLoopBarsChange: (bars: LoopBars) => void;
+  metronomeEnabled: boolean;
+  onToggleMetronome: () => void;
   blendRatio: number;
   onBlendChange: (ratio: number) => void;
   hasOriginalAudio: boolean;
@@ -58,6 +60,8 @@ export const BottomDock: React.FC<BottomDockProps> = ({
   customStepDisplay,
   loopBars,
   onLoopBarsChange,
+  metronomeEnabled,
+  onToggleMetronome,
   blendRatio,
   onBlendChange,
   hasOriginalAudio,
@@ -70,9 +74,9 @@ export const BottomDock: React.FC<BottomDockProps> = ({
   return (
     <div className="fixed inset-x-0 bottom-0 z-40 border-t border-zinc-800 bg-[#0B0B0E]/95 backdrop-blur-xl">
       {/* Compact Transport Strip */}
-      <div className="mx-auto flex max-w-[1440px] items-center justify-between gap-2 border-b border-zinc-800/80 px-3 py-1.5 sm:px-6 sm:py-2">
+      <div className="mx-auto flex max-w-[1440px] items-center justify-between gap-2 border-b border-zinc-800/80 px-2.5 py-1.5 sm:px-6 sm:py-2">
         {/* Play/Stop + Step Counter */}
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
           <button
             type="button"
             onClick={onTogglePlay}
@@ -102,6 +106,24 @@ export const BottomDock: React.FC<BottomDockProps> = ({
           >
             {stepDisplay}
           </span>
+
+          <button
+            type="button"
+            onClick={onToggleMetronome}
+            aria-pressed={metronomeEnabled}
+            aria-label={metronomeEnabled ? 'Metronome Click: On' : 'Metronome Click: Off'}
+            title="Switch Metronome On or Off"
+            className={`flex h-8 items-center gap-1 rounded-lg border px-2 text-[10px] font-bold transition-colors whitespace-nowrap sm:h-9 sm:px-2.5 sm:text-[11px] ${
+              metronomeEnabled
+                ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300'
+                : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Timer className="h-3.5 w-3.5 shrink-0" />
+            <span className="hidden xs:inline sm:inline">
+              {metronomeEnabled ? 'Click On' : 'Click Off'}
+            </span>
+          </button>
         </div>
 
         {/* Loop Bar Selector */}
@@ -128,7 +150,7 @@ export const BottomDock: React.FC<BottomDockProps> = ({
         </div>
 
         {/* Loop Only vs Blend Original Audio Crossfader */}
-        <div className="flex min-w-0 flex-1 items-center justify-end gap-2 sm:max-w-xs">
+        <div className="flex min-w-0 flex-1 items-center justify-end gap-1.5 sm:max-w-xs sm:gap-2">
           <button
             type="button"
             onClick={() => onBlendChange(0)}
@@ -152,7 +174,7 @@ export const BottomDock: React.FC<BottomDockProps> = ({
                 ? `Percussion ${percPercent}% · Original ${origPercent}%`
                 : 'Percussion Only (Upload audio to blend)'
             }
-            className="studio-slider w-20 min-w-[60px] flex-1 sm:w-28"
+            className="studio-slider w-12 min-w-[44px] max-w-[76px] flex-1 sm:w-28 sm:max-w-none"
           />
 
           <button

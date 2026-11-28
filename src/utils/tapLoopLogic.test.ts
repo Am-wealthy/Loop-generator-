@@ -9,8 +9,10 @@ import {
   cutoffToSliderRatio,
   estimateBpmFromTapIntervals,
   humanizeSteps,
+  isTapPadAudible,
   sliderRatioToCutoff,
   snapStepFromTiming,
+  toggleExclusivePadSolo,
 } from './tapLoopLogic.ts';
 
 test('snapStepFromTiming snaps live taps cleanly onto the active 16th-note tempo grid', () => {
@@ -67,4 +69,18 @@ test('createDefaultTapPads initializes 6 pads with tempo-locked 64 steps and rev
   const seventh = createNextTapPad(initial.length);
   assert.ok(seventh.name.toLowerCase().includes('bass'));
   assert.equal(seventh.steps.length, 64);
+});
+
+test('toggleExclusivePadSolo and isTapPadAudible isolate only the selected pad cleanly', () => {
+  const pads = createDefaultTapPads();
+  const soloedPad2 = toggleExclusivePadSolo(pads, pads[1].id);
+  assert.equal(isTapPadAudible(soloedPad2[0], true), false);
+  assert.equal(isTapPadAudible(soloedPad2[1], true), true);
+
+  const switchToPad3 = toggleExclusivePadSolo(soloedPad2, pads[2].id);
+  assert.equal(switchToPad3[1].soloed, false);
+  assert.equal(switchToPad3[2].soloed, true);
+
+  const restoreAll = toggleExclusivePadSolo(switchToPad3, pads[2].id);
+  assert.equal(restoreAll.some((p) => Boolean(p.soloed)), false);
 });

@@ -178,7 +178,7 @@ export const VoiceDirectorFab: React.FC<VoiceDirectorFabProps> = ({
   };
 
   return (
-    <div className="fixed bottom-[114px] right-3 z-40 flex flex-col items-end gap-2 sm:bottom-[120px] sm:right-6">
+    <div className="fixed bottom-[104px] right-3 z-40 flex flex-col items-end gap-2 sm:bottom-[106px] sm:right-5">
       {panelOpen && (
         <div
           role="dialog"
@@ -315,7 +315,7 @@ export const VoiceDirectorFab: React.FC<VoiceDirectorFabProps> = ({
             : 'Open Voice Over Control'
         }
         aria-expanded={panelOpen}
-        className={`flex h-12 w-12 items-center justify-center rounded-full border shadow-2xl transition-all active:scale-95 sm:h-14 sm:w-14 ${
+        className={`flex h-11 w-11 items-center justify-center rounded-full border shadow-2xl transition-all active:scale-95 sm:h-12 sm:w-12 ${
           isRecording
             ? 'border-rose-400 bg-rose-500 text-white shadow-[0_0_24px_rgba(244,63,94,0.55)] animate-pulse'
             : panelOpen
@@ -324,11 +324,11 @@ export const VoiceDirectorFab: React.FC<VoiceDirectorFabProps> = ({
         }`}
       >
         {isProcessing ? (
-          <Loader2 className="h-5 w-5 animate-spin sm:h-6 sm:w-6" />
+          <Loader2 className="h-5 w-5 animate-spin" />
         ) : isRecording ? (
-          <Square className="h-4 w-4 fill-current sm:h-5 sm:w-5" />
+          <Square className="h-4 w-4 fill-current" />
         ) : (
-          <Mic className="h-5 w-5 sm:h-6 sm:w-6" />
+          <Mic className="h-5 w-5" />
         )}
       </button>
     </div>

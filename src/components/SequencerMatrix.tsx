@@ -1,6 +1,7 @@
 import React, { useRef } from 'react';
 import { RefreshCw, Volume2 } from 'lucide-react';
 import type { LoopBars, PercussionTrack } from '../types/sequencer';
+import { formatVolumeDb } from '../utils/sequencerLogic';
 
 interface SequencerMatrixProps {
   tracks: PercussionTrack[];
@@ -226,13 +227,20 @@ export const SequencerMatrix: React.FC<SequencerMatrixProps> = ({
                     >
                       <Volume2 className="h-3.5 w-3.5" />
                     </button>
-                    <span
-                      className={`truncate text-xs font-semibold ${
-                        track.isClick ? 'text-emerald-300' : 'text-zinc-100'
+                    <button
+                      type="button"
+                      onClick={() => onToggleSolo(track.instrument_id)}
+                      title={`Click to hear only ${track.display_name}`}
+                      className={`truncate rounded px-1 py-0.5 text-left text-xs font-semibold transition-colors ${
+                        track.soloed
+                          ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/50'
+                          : track.isClick
+                          ? 'text-emerald-300 hover:bg-zinc-800/80'
+                          : 'text-zinc-100 hover:bg-zinc-800/80 hover:text-amber-300'
                       }`}
                     >
                       {track.display_name}
-                    </span>
+                    </button>
                   </div>
 
                   <div className="mt-1 flex min-w-0 items-center gap-1.5">
@@ -260,28 +268,29 @@ export const SequencerMatrix: React.FC<SequencerMatrixProps> = ({
                   </div>
                 </div>
 
-                {/* Solo, Mute, Volume Fader, Pan Knob */}
+                {/* Solo (Hear Only), Mute, Volume Fader, Pan Knob */}
                 <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
                   <div className="flex flex-col gap-1">
                     <button
                       type="button"
                       onClick={() => onToggleSolo(track.instrument_id)}
                       aria-pressed={Boolean(track.soloed)}
-                      aria-label={`Solo ${track.display_name}`}
-                      className={`h-5 w-6 rounded text-[10px] font-bold transition-colors ${
+                      aria-label={`Hear only ${track.display_name}`}
+                      title={track.soloed ? 'Playing only this track (click for all)' : 'Hear only this track'}
+                      className={`h-5 min-w-[34px] rounded px-1 text-[9px] font-bold transition-colors whitespace-nowrap ${
                         track.soloed
                           ? 'bg-amber-500 text-zinc-950 shadow-[0_0_8px_rgba(245,158,11,0.5)]'
-                          : 'border border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200'
+                          : 'border border-zinc-700 bg-zinc-900 text-zinc-300 hover:border-amber-500/50 hover:text-amber-300'
                       }`}
                     >
-                      S
+                      {track.soloed ? 'Only' : 'S'}
                     </button>
                     <button
                       type="button"
                       onClick={() => onToggleMute(track.instrument_id)}
                       aria-pressed={Boolean(track.muted)}
                       aria-label={`Mute ${track.display_name}`}
-                      className={`h-5 w-6 rounded text-[10px] font-bold transition-colors ${
+                      className={`h-5 min-w-[34px] rounded px-1 text-[10px] font-bold transition-colors ${
                         track.muted
                           ? 'bg-red-500 text-white shadow-[0_0_8px_rgba(239,68,68,0.45)]'
                           : 'border border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200'
@@ -294,7 +303,7 @@ export const SequencerMatrix: React.FC<SequencerMatrixProps> = ({
                   <div className="flex w-14 flex-col items-center gap-0.5 sm:w-16">
                     <input
                       type="range"
-                      min={-36}
+                      min={-60}
                       max={6}
                       step={0.5}
                       value={track.volume_db}
@@ -305,7 +314,7 @@ export const SequencerMatrix: React.FC<SequencerMatrixProps> = ({
                       className="studio-slider w-14 sm:w-16"
                     />
                     <span className="font-mono-tabular text-[10px] text-zinc-400">
-                      {track.volume_db > 0 ? `+${track.volume_db}` : track.volume_db} dB
+                      {formatVolumeDb(track.volume_db)}
                     </span>
                   </div>
 

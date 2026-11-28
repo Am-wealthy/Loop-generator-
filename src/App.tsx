@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  Component,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ErrorInfo,
+  type ReactNode,
+} from 'react';
 import { StudioAudioEngine } from './audio/AudioEngine';
 import { BottomDock } from './components/BottomDock';
 import { ExportModal } from './components/ExportModal';
@@ -34,8 +42,10 @@ import {
   clampBpm,
   clampPan,
   clampVolumeDb,
+  getPlaybackAudioDiagnostic,
   hydrateTracksWithFallbackSamples,
   matchFallbackCategory,
+  toggleExclusiveTrackSolo,
 } from './utils/sequencerLogic';
 import {
   clampCutoffHz,
@@ -46,6 +56,7 @@ import {
   DEFAULT_TAP_LOOP_SETTINGS,
   estimateBpmFromTapIntervals,
   humanizeSteps,
+  toggleExclusivePadSolo,
 } from './utils/tapLoopLogic';
 import { mixAudioBufferToMonoSegment } from './utils/audioUploadHelper';
 import {
@@ -54,14 +65,82 @@ import {
   findMatchingTrackIndex,
 } from './utils/voiceCommandLogic';
 import {
+  canRedoStemHistory,
+  canUndoStemHistory,
   createDefaultStemChannels,
   createNextStemChannel,
+  createStemHistory,
+  extendStemNoteDuration,
+  isAnyStemSoloed,
+  pushStemHistory,
+  redoStemHistory,
+  removeStemChannel,
   snapNotesToScale,
+  toggleExclusiveStemChannelSolo,
+  toggleExclusiveStemLoopSolo,
   toggleStemNote,
   transposeNotes,
+  undoStemHistory,
   upsertStemNote,
   type MusicalKey,
+  type StemHistorySnapshot,
+  type StemHistoryState,
 } from './utils/stemBuilderLogic';
+
+interface ErrorBoundaryState {
+  hasError: boolean;
+  message: string;
+}
+
+class StudioErrorBoundary extends Component<
+  { children: ReactNode },
+  ErrorBoundaryState
+> {
+  state: ErrorBoundaryState = { hasError: false, message: '' };
+
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return {
+      hasError: true,
+      message: error?.message || 'An unexpected audio or file error occurred.',
+    };
+  }
+
+  componentDidCatch(_error: Error, _info: ErrorInfo): void {
+    // Prevent unhandled React crash from blanking the page
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex min-h-screen flex-col items-center justify-center bg-[#09090B] px-6 text-center text-zinc-100">
+          <div className="max-w-md rounded-xl border border-rose-500/40 bg-zinc-950 p-6 shadow-2xl">
+            <h2 className="font-display text-lg font-bold text-rose-300">
+              Studio Recovered From File/Audio Error
+            </h2>
+            <p className="mt-2 text-xs text-zinc-400">{this.state.message}</p>
+            <div className="mt-5 flex justify-center gap-3">
+              <button
+                type="button"
+                onClick={() => this.setState({ hasError: false, message: '' })}
+                className="rounded-lg bg-amber-500 px-4 py-2 text-xs font-bold text-zinc-950 hover:bg-amber-400"
+              >
+                Recover Studio
+              </button>
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-2 text-xs font-semibold text-zinc-200 hover:bg-zinc-800"
+              >
+                Reload Page
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function extractWaveformPeaks(buffer: AudioBuffer, binCount = 96): number[] {
   const channel = buffer.getChannelData(0);
@@ -112,13 +191,26 @@ function inferAudioMimeType(file: File): string {
   return map[ext] || 'audio/mpeg';
 }
 
-export default function App() {
+function AppContent() {
   const engineRef = useRef<StudioAudioEngine | null>(null);
   if (!engineRef.current) {
     engineRef.current = new StudioAudioEngine();
   }
 
-  const [activePage, setActivePage] = useState<StudioPage>('compose');
+  const [activePage, setActivePage] = useState<StudioPage>(() => {
+    if (typeof window === 'undefined') return 'compose';
+    const param = new URLSearchParams(window.location.search).get('page');
+    if (
+      param === 'compose' ||
+      param === 'extract' ||
+      param === 'taploop' ||
+      param === 'sequencer' ||
+      param === 'stems'
+    ) {
+      return param;
+    }
+    return 'compose';
+  });
   const [targetGroove, setTargetGroove] = useState<string>('auto');
 
   const [bpm, setBpm] = useState<number>(INITIAL_HIGHLIFE_ARRANGEMENT.detected_bpm);
@@ -149,11 +241,16 @@ export default function App() {
 
   const [freesoundKey, setFreesoundKey] = useState('');
   const [serverFreesoundConfigured, setServerFreesoundConfigured] = useState(false);
+  const [secondarySoundConfigured, setSecondarySoundConfigured] = useState(false);
+  const [secondarySoundProvider, setSecondarySoundProvider] = useState('secondary');
   const [isFreesoundModalOpen, setIsFreesoundModalOpen] = useState(false);
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [swappingTrackId, setSwappingTrackId] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState(false);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
+  const [audioContextState, setAudioContextState] = useState<
+    AudioContextState | 'uninitialized'
+  >('uninitialized');
 
   // Global switchable metronome (sequencer + tap loop)
   const [metronomeEnabled, setMetronomeEnabled] = useState(true);
@@ -169,16 +266,38 @@ export default function App() {
   const tapTempoHistoryRef = useRef<number[]>([]);
   const flashTimersRef = useRef<Record<string, number>>({});
 
-  // Stem Builder state
-  const [stemChannels, setStemChannels] = useState<StemChannel[]>(() =>
-    createDefaultStemChannels()
-  );
-  const [selectedStemId, setSelectedStemId] = useState<string>('stem-rhodes');
-  const [stemLoopSource, setStemLoopSource] = useState<StemLoopSource>('sequencer');
-  const [stemLoopMuted, setStemLoopMuted] = useState(false);
-  const [stemLoopVolumeDb, setStemLoopVolumeDb] = useState(-2);
-  const [stemKey, setStemKey] = useState<MusicalKey>('C');
-  const [stemScale, setStemScale] = useState<ScaleType>('major');
+  // Phone Loop Audio for Row 1 of Stem Studio
+  const [phoneLoopFileName, setPhoneLoopFileName] = useState<string | null>(null);
+  const [phoneLoopDurationSec, setPhoneLoopDurationSec] = useState(0);
+  const [phoneLoopPeaks, setPhoneLoopPeaks] = useState<number[]>([]);
+
+  // Stem Builder Undo / Redo History State
+  const [stemHistory, setStemHistory] = useState<StemHistoryState>(() => {
+    const defaults = createDefaultStemChannels();
+    return createStemHistory({
+      stemChannels: defaults,
+      selectedChannelId: defaults[0]?.id ?? 'stem-hum-lead',
+      stemLoopSource: 'sequencer',
+      stemLoopMuted: false,
+      stemLoopSoloed: false,
+      stemLoopVolumeDb: -2,
+      stemKey: 'C',
+      stemScale: 'major',
+    });
+  });
+
+  const {
+    stemChannels,
+    selectedChannelId: selectedStemId,
+    stemLoopSource,
+    stemLoopMuted,
+    stemLoopSoloed = false,
+    stemLoopVolumeDb,
+    stemKey,
+    stemScale,
+  } = stemHistory.present;
+  const canUndoStem = canUndoStemHistory(stemHistory);
+  const canRedoStem = canRedoStemHistory(stemHistory);
 
   useEffect(() => {
     engineRef.current?.updateState({
@@ -210,9 +329,10 @@ export default function App() {
       stemChannels,
       stemLoopSource,
       stemLoopMuted,
+      stemLoopSoloed,
       stemLoopVolumeDb,
     });
-  }, [stemChannels, stemLoopSource, stemLoopMuted, stemLoopVolumeDb]);
+  }, [stemChannels, stemLoopSource, stemLoopMuted, stemLoopSoloed, stemLoopVolumeDb]);
 
   useEffect(() => {
     if (activePage === 'taploop' || activePage === 'stems') {
@@ -245,7 +365,38 @@ export default function App() {
     engine.setOnTapPadTrigger((padId) => {
       triggerPadFlash(padId);
     });
+    engine.setOnAudioStateChange((st) => {
+      setAudioContextState(st);
+    });
+
+    const handleFirstGesture = () => {
+      const ctx = engine.unlockSync();
+      setAudioContextState(ctx.state);
+    };
+    window.addEventListener('pointerdown', handleFirstGesture, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('touchstart', handleFirstGesture, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('touchend', handleFirstGesture, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('click', handleFirstGesture, {
+      capture: true,
+      passive: true,
+    });
+    window.addEventListener('keydown', handleFirstGesture, { capture: true });
+
     return () => {
+      window.removeEventListener('pointerdown', handleFirstGesture, true);
+      window.removeEventListener('touchstart', handleFirstGesture, true);
+      window.removeEventListener('touchend', handleFirstGesture, true);
+      window.removeEventListener('click', handleFirstGesture, true);
+      window.removeEventListener('keydown', handleFirstGesture, true);
       engine.stop();
     };
   }, [triggerPadFlash]);
@@ -256,6 +407,12 @@ export default function App() {
       .then((data) => {
         if (data?.serverFreesoundConfigured) {
           setServerFreesoundConfigured(true);
+        }
+        if (data?.secondarySoundConfigured) {
+          setSecondarySoundConfigured(true);
+        }
+        if (typeof data?.secondarySoundProvider === 'string') {
+          setSecondarySoundProvider(data.secondarySoundProvider);
         }
       })
       .catch(() => undefined);
@@ -302,9 +459,21 @@ export default function App() {
     [freesoundKey, serverFreesoundConfigured]
   );
 
+  const handleEnsurePlaying = useCallback(async () => {
+    const engine = engineRef.current;
+    if (!engine || isPlaying) return;
+    const ctx = engine.unlockSync();
+    setAudioContextState(ctx.state);
+    setIsPlaying(true);
+    await engine.start();
+    setAudioContextState(engine.getAudioContextState());
+  }, [isPlaying]);
+
   const handleTogglePlay = useCallback(async () => {
     const engine = engineRef.current;
     if (!engine) return;
+    const ctx = engine.unlockSync();
+    setAudioContextState(ctx.state);
     if (isPlaying) {
       engine.stop();
       setIsPlaying(false);
@@ -312,6 +481,7 @@ export default function App() {
     } else {
       setIsPlaying(true);
       await engine.start();
+      setAudioContextState(engine.getAudioContextState());
     }
   }, [isPlaying]);
 
@@ -430,6 +600,18 @@ export default function App() {
     );
   };
 
+  const handleToggleTapPadSolo = (padId: string) => {
+    let turningOn = false;
+    setTapPads((prev) => {
+      const next = toggleExclusivePadSolo(prev, padId);
+      turningOn = Boolean(next.find((p) => p.id === padId)?.soloed);
+      return next;
+    });
+    if (turningOn) {
+      void handleEnsurePlaying();
+    }
+  };
+
   const handleClearTapPadSteps = (padId: string) => {
     setTapPads((prev) =>
       prev.map((p) => (p.id === padId ? { ...p, steps: createEmptySteps() } : p))
@@ -444,6 +626,13 @@ export default function App() {
     const safeRev = clampUnit(reverb);
     setTapPads((prev) =>
       prev.map((p) => (p.id === padId ? { ...p, reverb: safeRev } : p))
+    );
+  };
+
+  const handleTapPadVolumeChange = (padId: string, db: number) => {
+    const safeDb = clampVolumeDb(db);
+    setTapPads((prev) =>
+      prev.map((p) => (p.id === padId ? { ...p, volume_db: safeDb } : p))
     );
   };
 
@@ -728,11 +917,15 @@ export default function App() {
   };
 
   const handleToggleSolo = (instrumentId: string) => {
-    setTracks((prev) =>
-      prev.map((t) =>
-        t.instrument_id === instrumentId ? { ...t, soloed: !t.soloed } : t
-      )
-    );
+    let turningOn = false;
+    setTracks((prev) => {
+      const next = toggleExclusiveTrackSolo(prev, instrumentId);
+      turningOn = Boolean(next.find((t) => t.instrument_id === instrumentId)?.soloed);
+      return next;
+    });
+    if (turningOn) {
+      void handleEnsurePlaying();
+    }
   };
 
   const handleVolumeChange = (instrumentId: string, db: number) => {
@@ -798,26 +991,110 @@ export default function App() {
     }
   };
 
-  // Stem Builder Handlers
-  const handleAddStemChannel = () => {
-    const next = createNextStemChannel(stemChannels.length);
-    setStemChannels((prev) => [...prev, next]);
-    setSelectedStemId(next.id);
+  // Stem Builder Handlers (with Undo / Redo History Stack)
+  const commitStemUpdate = useCallback(
+    (updater: (present: StemHistorySnapshot) => StemHistorySnapshot, recordHistory = true) => {
+      setStemHistory((prev) => {
+        const nextPresent = updater(prev.present);
+        if (!recordHistory) {
+          return { ...prev, present: nextPresent };
+        }
+        return pushStemHistory(prev, nextPresent);
+      });
+    },
+    []
+  );
+
+  const handleUndoStem = useCallback(() => {
+    engineRef.current?.stopStemHumPreview();
+    setStemHistory((prev) => undoStemHistory(prev));
+  }, []);
+
+  const handleRedoStem = useCallback(() => {
+    engineRef.current?.stopStemHumPreview();
+    setStemHistory((prev) => redoStemHistory(prev));
+  }, []);
+
+  const handleSelectStemChannel = (channelId: string) => {
+    commitStemUpdate((p) => ({ ...p, selectedChannelId: channelId }), false);
   };
 
-  const handleRemoveStemChannel = (channelId: string) => {
-    if (stemChannels.length <= 1) return;
-    engineRef.current?.clearStemHumAudio(channelId);
-    const remaining = stemChannels.filter((c) => c.id !== channelId);
-    setStemChannels(remaining);
-    if (selectedStemId === channelId && remaining[0]) {
-      setSelectedStemId(remaining[0].id);
+  const handleSelectStemLoopSource = (source: StemLoopSource) => {
+    commitStemUpdate((p) => ({ ...p, stemLoopSource: source }));
+  };
+
+  const handleToggleStemLoopMuted = () => {
+    commitStemUpdate((p) => ({ ...p, stemLoopMuted: !p.stemLoopMuted }));
+  };
+
+  const handleToggleStemLoopSolo = () => {
+    const nextSoloed = !stemLoopSoloed || stemChannels.some((c) => Boolean(c.soloed));
+    commitStemUpdate((p) => toggleExclusiveStemLoopSolo(p));
+    if (nextSoloed) {
+      void handleEnsurePlaying();
     }
   };
 
+  const handleStemLoopVolumeChange = (db: number) => {
+    commitStemUpdate((p) => ({ ...p, stemLoopVolumeDb: clampVolumeDb(db) }), false);
+  };
+
+  const handleStemKeyChange = (key: MusicalKey) => {
+    commitStemUpdate((p) => ({ ...p, stemKey: key }));
+  };
+
+  const handleStemScaleChange = (scale: ScaleType) => {
+    commitStemUpdate((p) => ({ ...p, stemScale: scale }));
+  };
+
+  const handleUploadPhoneLoopFile = async (file: File) => {
+    if (file.size > 40 * 1024 * 1024) {
+      throw new Error('Loop audio file must be under 40 MB.');
+    }
+    const result = await engineRef.current!.loadStemPhoneLoopFile(file);
+    setPhoneLoopFileName(file.name);
+    setPhoneLoopDurationSec(result.durationSeconds);
+    setPhoneLoopPeaks(result.peaks);
+    commitStemUpdate((p) => ({
+      ...p,
+      stemLoopSource: 'phone_audio',
+      stemLoopMuted: false,
+    }));
+    setStatusBanner(`Loaded "${file.name}" into Row 1 Loop Bed`);
+    window.setTimeout(() => setStatusBanner(null), 3000);
+  };
+
+  const handleClearPhoneLoopFile = () => {
+    engineRef.current?.clearStemPhoneLoop();
+    setPhoneLoopFileName(null);
+    setPhoneLoopDurationSec(0);
+    setPhoneLoopPeaks([]);
+    commitStemUpdate((p) => ({
+      ...p,
+      stemLoopSource: p.stemLoopSource === 'phone_audio' ? 'sequencer' : p.stemLoopSource,
+    }));
+  };
+
+  const handleAddStemChannel = () => {
+    commitStemUpdate((p) => {
+      const next = createNextStemChannel(p.stemChannels.length);
+      return {
+        ...p,
+        stemChannels: [...p.stemChannels, next],
+        selectedChannelId: next.id,
+      };
+    });
+  };
+
+  const handleRemoveStemChannel = (channelId: string) => {
+    engineRef.current?.clearStemHumAudio(channelId);
+    commitStemUpdate((p) => removeStemChannel(p, channelId));
+  };
+
   const handleStemSoundChange = (channelId: string, soundId: KeyboardSoundId) => {
-    setStemChannels((prev) =>
-      prev.map((ch) =>
+    commitStemUpdate((p) => ({
+      ...p,
+      stemChannels: p.stemChannels.map((ch) =>
         ch.id === channelId
           ? {
               ...ch,
@@ -825,34 +1102,66 @@ export default function App() {
               voiceMode: 'keyboard',
             }
           : ch
-      )
-    );
+      ),
+    }));
     void engineRef.current?.triggerKeyboardNoteNow(soundId, 60, 88, 0.35);
   };
 
+  const handleStemCustomSampleChange = (channelId: string, sample: SampleCandidate) => {
+    commitStemUpdate((p) => ({
+      ...p,
+      stemChannels: p.stemChannels.map((ch) =>
+        ch.id === channelId
+          ? {
+              ...ch,
+              voiceMode: 'custom_sample',
+              customVoiceSample: sample,
+            }
+          : ch
+      ),
+    }));
+    void engineRef.current?.triggerCustomSampleNoteNow(sample, channelId, 60, 90, 0.4);
+    setStatusBanner(`Assigned "${sample.name}" voice to row`);
+    window.setTimeout(() => setStatusBanner(null), 2600);
+  };
+
   const handleStemVoiceModeChange = (channelId: string, voiceMode: StemVoiceMode) => {
-    setStemChannels((prev) =>
-      prev.map((ch) => (ch.id === channelId ? { ...ch, voiceMode } : ch))
-    );
+    commitStemUpdate((p) => ({
+      ...p,
+      stemChannels: p.stemChannels.map((ch) =>
+        ch.id === channelId ? { ...ch, voiceMode } : ch
+      ),
+    }));
   };
 
   const handleToggleStemMute = (channelId: string) => {
-    setStemChannels((prev) =>
-      prev.map((ch) => (ch.id === channelId ? { ...ch, muted: !ch.muted } : ch))
-    );
+    commitStemUpdate((p) => ({
+      ...p,
+      stemChannels: p.stemChannels.map((ch) =>
+        ch.id === channelId ? { ...ch, muted: !ch.muted } : ch
+      ),
+    }));
   };
 
   const handleToggleStemSolo = (channelId: string) => {
-    setStemChannels((prev) =>
-      prev.map((ch) => (ch.id === channelId ? { ...ch, soloed: !ch.soloed } : ch))
-    );
+    const target = stemChannels.find((c) => c.id === channelId);
+    const soloedCount = stemChannels.filter((c) => Boolean(c.soloed)).length;
+    const turningOff = Boolean(target?.soloed) && !stemLoopSoloed && soloedCount === 1;
+    commitStemUpdate((p) => toggleExclusiveStemChannelSolo(p, channelId));
+    if (!turningOff) {
+      void handleEnsurePlaying();
+    }
   };
 
   const handleStemVolumeChange = (channelId: string, db: number) => {
-    setStemChannels((prev) =>
-      prev.map((ch) =>
-        ch.id === channelId ? { ...ch, volume_db: clampVolumeDb(db) } : ch
-      )
+    commitStemUpdate(
+      (p) => ({
+        ...p,
+        stemChannels: p.stemChannels.map((ch) =>
+          ch.id === channelId ? { ...ch, volume_db: clampVolumeDb(db) } : ch
+        ),
+      }),
+      false
     );
   };
 
@@ -864,77 +1173,131 @@ export default function App() {
   ) => {
     const ch = stemChannels.find((c) => c.id === channelId);
     const wasPresent = ch?.notes.some((n) => n.step === step && n.midi === midi);
-    setStemChannels((prev) =>
-      prev.map((c) =>
+    commitStemUpdate((p) => ({
+      ...p,
+      stemChannels: p.stemChannels.map((c) =>
         c.id === channelId
           ? { ...c, notes: toggleStemNote(c.notes, step, midi, durationSteps, 90) }
           : c
-      )
-    );
+      ),
+    }));
     if (!wasPresent && ch) {
-      void engineRef.current?.triggerKeyboardNoteNow(
-        ch.soundId,
-        midi,
-        90,
-        0.32,
-        ch.volume_db,
-        ch.pan
-      );
+      if (ch.voiceMode === 'custom_sample' && ch.customVoiceSample) {
+        void engineRef.current?.triggerCustomSampleNoteNow(
+          ch.customVoiceSample,
+          ch.id,
+          midi,
+          90,
+          0.32,
+          ch.volume_db,
+          ch.pan
+        );
+      } else {
+        void engineRef.current?.triggerKeyboardNoteNow(
+          ch.soundId,
+          midi,
+          90,
+          0.32,
+          ch.volume_db,
+          ch.pan
+        );
+      }
     }
   };
 
-  const handleRecordStemNote = useCallback((channelId: string, note: StemNote) => {
-    setStemChannels((prev) =>
-      prev.map((c) =>
-        c.id === channelId ? { ...c, notes: upsertStemNote(c.notes, note) } : c
-      )
-    );
-  }, []);
+  const handleRecordStemNote = useCallback(
+    (channelId: string, note: StemNote) => {
+      commitStemUpdate((p) => ({
+        ...p,
+        stemChannels: p.stemChannels.map((c) =>
+          c.id === channelId ? { ...c, notes: upsertStemNote(c.notes, note) } : c
+        ),
+      }));
+    },
+    [commitStemUpdate]
+  );
+
+  const handleExtendStemNote = useCallback(
+    (channelId: string, step: number, midi: number, durationSteps: number) => {
+      commitStemUpdate(
+        (p) => ({
+          ...p,
+          stemChannels: p.stemChannels.map((c) =>
+            c.id === channelId
+              ? {
+                  ...c,
+                  notes: extendStemNoteDuration(c.notes, step, midi, durationSteps),
+                }
+              : c
+          ),
+        }),
+        false
+      );
+    },
+    [commitStemUpdate]
+  );
 
   const handleClearStemNotes = (channelId: string) => {
-    setStemChannels((prev) =>
-      prev.map((c) => (c.id === channelId ? { ...c, notes: [] } : c))
-    );
+    commitStemUpdate((p) => ({
+      ...p,
+      stemChannels: p.stemChannels.map((c) =>
+        c.id === channelId ? { ...c, notes: [] } : c
+      ),
+    }));
   };
 
   const handleFixOffKeyNotes = (channelId: string) => {
-    setStemChannels((prev) =>
-      prev.map((c) =>
+    commitStemUpdate((p) => ({
+      ...p,
+      stemChannels: p.stemChannels.map((c) =>
         c.id === channelId
           ? {
               ...c,
-              voiceMode: 'keyboard',
-              notes: snapNotesToScale(c.notes, stemKey, stemScale),
+              voiceMode: c.voiceMode === 'custom_sample' ? 'custom_sample' : 'keyboard',
+              notes: snapNotesToScale(c.notes, p.stemKey, p.stemScale),
             }
           : c
-      )
-    );
-    setStatusBanner(`Snapped notes to ${stemKey} ${stemScale} and switched to keyboard voice`);
+      ),
+    }));
+    setStatusBanner(`Snapped notes to ${stemKey} ${stemScale}`);
     window.setTimeout(() => setStatusBanner(null), 2800);
   };
 
   const handleTransposeStem = (channelId: string, semitones: number) => {
-    setStemChannels((prev) =>
-      prev.map((c) =>
+    commitStemUpdate((p) => ({
+      ...p,
+      stemChannels: p.stemChannels.map((c) =>
         c.id === channelId
           ? { ...c, notes: transposeNotes(c.notes, semitones) }
           : c
-      )
-    );
+      ),
+    }));
   };
 
   const handlePlayKeyboardKey = async (midi: number, recordToRoll: boolean) => {
     const active = stemChannels.find((c) => c.id === selectedStemId) ?? stemChannels[0];
     if (!active || !engineRef.current) return;
+    engineRef.current.unlockSync();
 
-    const timing = await engineRef.current.triggerKeyboardNoteNow(
-      active.soundId,
-      midi,
-      92,
-      0.38,
-      active.volume_db,
-      active.pan
-    );
+    const timing =
+      active.voiceMode === 'custom_sample' && active.customVoiceSample
+        ? await engineRef.current.triggerCustomSampleNoteNow(
+            active.customVoiceSample,
+            active.id,
+            midi,
+            92,
+            0.38,
+            active.volume_db,
+            active.pan
+          )
+        : await engineRef.current.triggerKeyboardNoteNow(
+            active.soundId,
+            midi,
+            92,
+            0.38,
+            active.volume_db,
+            active.pan
+          );
 
     if (recordToRoll && timing.wasPlaying) {
       handleRecordStemNote(active.id, {
@@ -946,35 +1309,118 @@ export default function App() {
     }
   };
 
-  const handleEnsurePlaying = async () => {
-    if (!engineRef.current || isPlaying) return;
-    setIsPlaying(true);
-    await engineRef.current.start();
-  };
+  // handleEnsurePlaying is defined above for shared transport start
 
   const handleSaveHumAudio = async (channelId: string, blob: Blob) => {
     try {
       await engineRef.current?.loadStemHumAudio(channelId, blob);
-      setStemChannels((prev) =>
-        prev.map((ch) =>
-          ch.id === channelId ? { ...ch, hasHumAudio: true } : ch
-        )
-      );
+      commitStemUpdate((p) => ({
+        ...p,
+        stemChannels: p.stemChannels.map((ch) =>
+          ch.id === channelId
+            ? { ...ch, hasHumAudio: true, voiceMode: 'hum_audio' }
+            : ch
+        ),
+      }));
     } catch {
       // If MediaRecorder codec cannot be decoded on this browser, keep MIDI notes cleanly
     }
   };
 
+  const handleSaveHumBuffer = useCallback(
+    (channelId: string, buffer: AudioBuffer) => {
+      engineRef.current?.setStemHumAudioBuffer(channelId, buffer);
+      commitStemUpdate(
+        (p) => ({
+          ...p,
+          stemChannels: p.stemChannels.map((ch) =>
+            ch.id === channelId
+              ? {
+                  ...ch,
+                  hasHumAudio: true,
+                  voiceMode: ch.voiceMode === 'custom_sample' ? 'custom_sample' : 'keyboard',
+                }
+              : ch
+          ),
+        }),
+        false
+      );
+    },
+    [commitStemUpdate]
+  );
+
+  const handleReplaceHumNotes = useCallback(
+    (channelId: string, notes: StemNote[]) => {
+      commitStemUpdate((p) => ({
+        ...p,
+        stemChannels: p.stemChannels.map((ch) =>
+          ch.id === channelId
+            ? {
+                ...ch,
+                hasHumAudio: true,
+                voiceMode: ch.voiceMode === 'custom_sample' ? 'custom_sample' : 'keyboard',
+                notes,
+              }
+            : ch
+        ),
+      }));
+    },
+    [commitStemUpdate]
+  );
+
   const handleClearHumAudio = (channelId: string) => {
     engineRef.current?.clearStemHumAudio(channelId);
-    setStemChannels((prev) =>
-      prev.map((ch) =>
+    commitStemUpdate((p) => ({
+      ...p,
+      stemChannels: p.stemChannels.map((ch) =>
         ch.id === channelId
           ? { ...ch, hasHumAudio: false, voiceMode: 'keyboard' }
           : ch
-      )
-    );
+      ),
+    }));
   };
+
+  const handlePlayHumPreview = async (channelId: string) => {
+    if (!engineRef.current) return false;
+    engineRef.current.unlockSync();
+    return engineRef.current.playStemHumPreview(channelId);
+  };
+
+  const handleStopHumPreview = () => {
+    engineRef.current?.stopStemHumPreview();
+  };
+
+  const handleAuditionKeyboardVoice = (soundId: KeyboardSoundId) => {
+    engineRef.current?.unlockSync();
+    void engineRef.current?.triggerKeyboardNoteNow(soundId, 60, 88, 0.35);
+  };
+
+  const handleUnlockAudioSync = useCallback(() => {
+    const ctx = engineRef.current?.unlockSync();
+    if (ctx) setAudioContextState(ctx.state);
+  }, []);
+
+  const handleGetSharedAudioContext = useCallback(
+    () => engineRef.current!.getSharedAudioContext(),
+    []
+  );
+
+  const handleAfterMicAcquired = useCallback(
+    () => engineRef.current!.resumeAfterMicStart(),
+    []
+  );
+
+  const handleSetHumRecordingState = useCallback(
+    (active: boolean, muteBacking: boolean) => {
+      engineRef.current?.setHumRecordingState(active, muteBacking);
+    },
+    []
+  );
+
+  const handleGetPlaybackTiming = useCallback(
+    () => engineRef.current!.getCurrentPlaybackTiming(),
+    []
+  );
 
   const handleConfirmExport = async (options: ExportOptions) => {
     if (!engineRef.current || isExporting) return;
@@ -995,6 +1441,8 @@ export default function App() {
         stemChannels,
         stemLoopSource,
         stemLoopMuted,
+        stemLoopSoloed,
+        stemLoopVolumeDb,
         exportOptions: options,
       });
       const url = URL.createObjectURL(wavBlob);
@@ -1211,8 +1659,42 @@ export default function App() {
     }
   };
 
+  const anyTapSoloed = tapPads.some((p) => Boolean(p.soloed));
+  const activeTapPadStepCount = tapPads.reduce(
+    (sum, p) =>
+      sum +
+      (!p.muted && (!anyTapSoloed || Boolean(p.soloed))
+        ? p.steps.filter((v) => v > 0).length
+        : 0),
+    0
+  );
+  const anyStemSoloed = isAnyStemSoloed(stemLoopSoloed, stemChannels);
+  const audibleStemNotesOrHumCount = stemChannels.reduce(
+    (sum, ch) =>
+      sum +
+      (ch.muted || (anyStemSoloed && !ch.soloed)
+        ? 0
+        : ch.voiceMode === 'hum_audio' && ch.hasHumAudio
+        ? 1
+        : ch.notes.length),
+    0
+  );
+  const audioDiagnostic = getPlaybackAudioDiagnostic({
+    isPlaying,
+    audioContextState,
+    activePage,
+    metronomeEnabled,
+    hasPlayableOriginal,
+    blendRatio,
+    activeTapPadStepCount,
+    stemLoopSource,
+    stemLoopMuted,
+    hasPhoneLoopAudio: Boolean(phoneLoopFileName),
+    audibleStemNotesOrHumCount,
+  });
+
   return (
-    <div className="min-h-screen overflow-x-hidden bg-[#09090B] text-zinc-100 pb-32">
+    <div className="min-h-screen overflow-x-hidden bg-[#09090B] text-zinc-100 pb-36">
       <StudioHeader
         bpm={bpm}
         onBpmChange={setBpm}
@@ -1226,6 +1708,27 @@ export default function App() {
       />
 
       <main className="mx-auto max-w-[1440px] space-y-4 px-3 pt-4 sm:space-y-5 sm:px-6 sm:pt-5">
+        {audioDiagnostic && (
+          <div
+            role="alert"
+            className="flex items-center justify-between gap-3 rounded-lg border border-rose-500/40 bg-rose-500/12 px-4 py-2 text-xs font-medium text-rose-200"
+          >
+            <span>{audioDiagnostic.message}</span>
+            {audioDiagnostic.kind === 'context_blocked' && (
+              <button
+                type="button"
+                onClick={() => {
+                  const ctx = engineRef.current?.unlockSync();
+                  if (ctx) setAudioContextState(ctx.state);
+                }}
+                className="shrink-0 rounded-md bg-amber-500 px-3 py-1 text-xs font-bold text-zinc-950 hover:bg-amber-400"
+              >
+                Enable Sound
+              </button>
+            )}
+          </div>
+        )}
+
         {statusBanner && (
           <div
             role="status"
@@ -1292,9 +1795,11 @@ export default function App() {
             onSelectPreset={handleSelectTapPreset}
             onReplacePadFile={(padId, file) => void handleReplaceTapPadFile(padId, file)}
             onTogglePadMute={handleToggleTapPadMute}
+            onTogglePadSolo={handleToggleTapPadSolo}
             onClearPadSteps={handleClearTapPadSteps}
             onClearAllPads={handleClearAllTapLoops}
             onPadReverbChange={handleTapPadReverbChange}
+            onPadVolumeChange={handleTapPadVolumeChange}
             onTogglePadStep={handleToggleTapStep}
             onSetPadStepVelocity={handleSetTapStepVelocity}
             onHumanizePad={handleHumanizePad}
@@ -1344,39 +1849,65 @@ export default function App() {
             tapPads={tapPads}
             stemLoopSource={stemLoopSource}
             stemLoopMuted={stemLoopMuted}
+            stemLoopSoloed={stemLoopSoloed}
             stemLoopVolumeDb={stemLoopVolumeDb}
+            phoneLoopFileName={phoneLoopFileName}
+            phoneLoopDurationSec={phoneLoopDurationSec}
+            phoneLoopPeaks={phoneLoopPeaks}
             stemChannels={stemChannels}
             selectedChannelId={selectedStemId}
             rootKey={stemKey}
             scaleType={stemScale}
+            canUndo={canUndoStem}
+            canRedo={canRedoStem}
+            freesoundKey={freesoundKey}
+            secondarySoundConfigured={secondarySoundConfigured}
+            secondarySoundProvider={secondarySoundProvider}
+            onUndo={handleUndoStem}
+            onRedo={handleRedoStem}
             onSelectBar={(bar) => {
               setFollowPlayhead(false);
               setActiveBar(bar);
             }}
             onToggleFollowPlayhead={() => setFollowPlayhead((f) => !f)}
-            onSelectLoopSource={setStemLoopSource}
-            onToggleLoopMuted={() => setStemLoopMuted((v) => !v)}
-            onLoopVolumeChange={setStemLoopVolumeDb}
-            onSelectChannel={setSelectedStemId}
+            onSelectLoopSource={handleSelectStemLoopSource}
+            onUploadPhoneLoopFile={handleUploadPhoneLoopFile}
+            onClearPhoneLoopFile={handleClearPhoneLoopFile}
+            onToggleLoopMuted={handleToggleStemLoopMuted}
+            onToggleLoopSolo={handleToggleStemLoopSolo}
+            onLoopVolumeChange={handleStemLoopVolumeChange}
+            onSelectChannel={handleSelectStemChannel}
             onAddChannel={handleAddStemChannel}
             onRemoveChannel={handleRemoveStemChannel}
             onChannelSoundChange={handleStemSoundChange}
+            onChannelCustomSampleChange={handleStemCustomSampleChange}
             onChannelVoiceModeChange={handleStemVoiceModeChange}
             onChannelMuteToggle={handleToggleStemMute}
             onChannelSoloToggle={handleToggleStemSolo}
             onChannelVolumeChange={handleStemVolumeChange}
             onToggleNote={handleToggleStemNote}
             onRecordNote={handleRecordStemNote}
+            onExtendNote={handleExtendStemNote}
             onClearChannelNotes={handleClearStemNotes}
             onFixOffKeyNotes={handleFixOffKeyNotes}
             onTransposeChannel={handleTransposeStem}
-            onRootKeyChange={setStemKey}
-            onScaleTypeChange={setStemScale}
+            onRootKeyChange={handleStemKeyChange}
+            onScaleTypeChange={handleStemScaleChange}
             onPlayKeyboardKey={(midi, rec) => void handlePlayKeyboardKey(midi, rec)}
+            onUnlockAudioSync={handleUnlockAudioSync}
             onEnsurePlaying={handleEnsurePlaying}
-            getPlaybackTiming={() => engineRef.current!.getCurrentPlaybackTiming()}
+            getSharedAudioContext={handleGetSharedAudioContext}
+            onAfterMicAcquired={handleAfterMicAcquired}
+            onSetHumRecordingState={handleSetHumRecordingState}
+            getPlaybackTiming={handleGetPlaybackTiming}
             onSaveHumAudio={handleSaveHumAudio}
+            onSaveHumBuffer={handleSaveHumBuffer}
+            onReplaceHumNotes={handleReplaceHumNotes}
             onClearHumAudio={handleClearHumAudio}
+            onPlayHumPreview={handlePlayHumPreview}
+            onStopHumPreview={handleStopHumPreview}
+            onAuditionKeyboardVoice={handleAuditionKeyboardVoice}
+            onOpenFreesoundKeyModal={() => setIsFreesoundModalOpen(true)}
           />
         )}
       </main>
@@ -1444,5 +1975,13 @@ export default function App() {
         onClose={() => setIsFreesoundModalOpen(false)}
       />
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <StudioErrorBoundary>
+      <AppContent />
+    </StudioErrorBoundary>
   );
 }

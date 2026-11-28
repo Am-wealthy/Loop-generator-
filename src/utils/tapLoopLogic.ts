@@ -154,6 +154,24 @@ export function countActiveSteps(steps: number[], loopBars: LoopBars): number {
   return count;
 }
 
+export function isTapPadAudible(pad: TapPad, anySoloed: boolean): boolean {
+  if (pad.muted) return false;
+  if (anySoloed && !pad.soloed) return false;
+  return true;
+}
+
+export function toggleExclusivePadSolo(pads: TapPad[], padId: string): TapPad[] {
+  const target = pads.find((p) => p.id === padId);
+  if (!target) return pads;
+  const soloCount = pads.filter((p) => Boolean(p.soloed)).length;
+  const turnOff = Boolean(target.soloed) && soloCount === 1;
+  return pads.map((p) => ({
+    ...p,
+    soloed: turnOff ? false : p.id === padId,
+    muted: !turnOff && p.id === padId ? false : p.muted,
+  }));
+}
+
 export function createDefaultTapPads(): TapPad[] {
   return TAP_PAD_PRESETS.slice(0, 6).map((preset, index) => ({
     id: `pad-default-${index + 1}`,
@@ -163,6 +181,7 @@ export function createDefaultTapPads(): TapPad[] {
     sample: preset.sample,
     steps: createEmptySteps(),
     muted: false,
+    soloed: false,
     volume_db: -1.5,
     reverb: preset.category === 'Bass' || preset.category === 'Low End' ? 0.05 : 0.25,
   }));
@@ -183,6 +202,7 @@ export function createNextTapPad(existingCount: number): TapPad {
     sample: preset.sample,
     steps: createEmptySteps(),
     muted: false,
+    soloed: false,
     volume_db: -1.5,
     reverb: isLowEnd ? 0.05 : 0.25,
   };

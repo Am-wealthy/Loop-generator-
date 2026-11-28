@@ -29,6 +29,12 @@ export function dbToGain(db: number): number {
   return Math.pow(10, db / 20);
 }
 
+export function formatVolumeDb(db: number): string {
+  const safe = clampVolumeDb(db);
+  if (safe <= -59.5) return 'Off';
+  return safe > 0 ? `+${safe} dB` : `${safe} dB`;
+}
+
 export function getStepDurationSeconds(bpm: number): number {
   const safeBpm = clampBpm(bpm);
   return 60 / safeBpm / 4; // 16th-note duration
@@ -51,6 +57,56 @@ export function isTrackAudible(track: PercussionTrack, anySoloed: boolean): bool
   if (track.muted) return false;
   if (anySoloed && !track.soloed) return false;
   return true;
+}
+
+/**
+ * Exclusive "Hear Only" toggle for percussion tracks:
+ * clicking an unselected or non-sole track solos ONLY that track (silencing all others);
+ * clicking an already sole-soloed track returns to full mix.
+ */
+export function toggleExclusiveTrackSolo(
+  tracks: PercussionTrack[],
+  instrumentId: string
+): PercussionTrack[] {
+  const target = tracks.find((t) => t.instrument_id === instrumentId);
+  if (!target) return tracks;
+  const soloCount = tracks.filter((t) => Boolean(t.soloed)).length;
+  const turnOff = Boolean(target.soloed) && soloCount === 1;
+  return tracks.map((t) => ({
+    ...t,
+    soloed: turnOff ? false : t.instrument_id === instrumentId,
+    muted: !turnOff && t.instrument_id === instrumentId ? false : t.muted,
+  }));
+}
+
+/**
+ * Determines whether a phone/desktop uploaded audio file should stream via HTMLAudioElement
+ * instead of full PCM decodeAudioData in RAM (preventing mobile browser OOM crashes).
+ */
+export function shouldStreamAudioFile(
+  fileSizeBytes: number,
+  durationSeconds: number,
+  maxDecodeBytes = 6 * 1024 * 1024,
+  maxDecodeSeconds = 90
+): boolean {
+  if (fileSizeBytes > maxDecodeBytes) return true;
+  if (Number.isFinite(durationSeconds) && durationSeconds > maxDecodeSeconds) return true;
+  return false;
+}
+
+export function buildFallbackWaveformPeaks(binCount = 48, seedOffset = 0): number[] {
+  const safeCount = Math.max(8, Math.min(256, binCount));
+  const peaks: number[] = [];
+  for (let i = 0; i < safeCount; i++) {
+    const wave =
+      0.28 +
+      0.52 *
+        Math.abs(
+          Math.sin((i + seedOffset) * 0.42) * Math.cos((i + seedOffset) * 0.19)
+        );
+    peaks.push(Number(Math.min(1, wave).toFixed(3)));
+  }
+  return peaks;
 }
 
 export function matchFallbackCategory(
@@ -342,3 +398,80 @@ export function encodeRepeatedStereoWavBlob(
 
   return new Blob(parts, { type: 'audio/wav' });
 }
+
+export interface AudioPlaybackDiagnosticInput {
+  isPlaying: boolean;
+  audioContextState: AudioContextState | 'uninitialized' | string;
+  activePage: 'compose' | 'extract' | 'taploop' | 'sequencer' | 'stems';
+  metronomeEnabled: boolean;
+  hasPlayableOriginal: boolean;
+  blendRatio: number;
+  activeTapPadStepCount: number;
+  stemLoopSource: 'sequencer' | 'taploop' | 'phone_audio';
+  stemLoopMuted: boolean;
+  hasPhoneLoopAudio: boolean;
+  audibleStemNotesOrHumCount: number;
+}
+
+export interface AudioPlaybackDiagnostic {
+  kind: 'context_blocked' | 'empty_loop';
+  message: string;
+}
+
+export function getPlaybackAudioDiagnostic(
+  input: AudioPlaybackDiagnosticInput
+): AudioPlaybackDiagnostic | null {
+  if (!input.isPlaying) return null;
+
+  if (
+    input.audioContextState === 'suspended' ||
+    input.audioContextState === 'interrupted'
+  ) {
+    return {
+      kind: 'context_blocked',
+      message:
+        'Browser sound is paused — tap here to unlock audio (and check device volume / mute switch).',
+    };
+  }
+
+  const origAudible = input.hasPlayableOriginal && input.blendRatio > 0.02;
+
+  if (input.activePage === 'taploop') {
+    if (
+      input.activeTapPadStepCount === 0 &&
+      !input.metronomeEnabled &&
+      !origAudible
+    ) {
+      return {
+        kind: 'empty_loop',
+        message:
+          'No pad beats are recorded yet and Click is Off — tap any pad or enable Click On to hear audio.',
+      };
+    }
+  }
+
+  if (input.activePage === 'stems') {
+    const phoneSelectedWithoutFile =
+      input.stemLoopSource === 'phone_audio' && !input.hasPhoneLoopAudio;
+    const tapSelectedEmpty =
+      input.stemLoopSource === 'taploop' && input.activeTapPadStepCount === 0;
+    const row1Silent =
+      input.stemLoopMuted || phoneSelectedWithoutFile || tapSelectedEmpty;
+
+    if (
+      row1Silent &&
+      input.audibleStemNotesOrHumCount === 0 &&
+      !input.metronomeEnabled &&
+      !origAudible
+    ) {
+      return {
+        kind: 'empty_loop',
+        message:
+          'No active notes or loop audio in Stem Studio — switch Row 1 to Sequencer, upload a loop, or add notes.',
+      };
+    }
+  }
+
+  return null;
+}
+

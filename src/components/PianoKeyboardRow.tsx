@@ -117,9 +117,9 @@ export const PianoKeyboardRow: React.FC<PianoKeyboardRowProps> = ({
   return (
     <section
       aria-label="Interactive Keyboard Row"
-      className="rounded-xl border border-zinc-800/90 bg-[#111114] p-3 sm:p-4"
+      className="rounded-xl border border-zinc-800/90 bg-[#111114] p-3 sm:p-3.5"
     >
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+      <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <Keyboard className="h-4 w-4 text-amber-400" />
           <h3 className="text-xs font-bold tracking-wide text-zinc-100 uppercase">
@@ -172,7 +172,7 @@ export const PianoKeyboardRow: React.FC<PianoKeyboardRowProps> = ({
       </div>
 
       {/* 2-Octave Playable Keyboard */}
-      <div className="relative h-28 w-full select-none overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950 sm:h-32">
+      <div className="relative h-20 w-full select-none overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950 sm:h-24">
         {/* White Keys */}
         <div className="grid h-full w-full grid-cols-14 gap-px bg-zinc-800">
           {whiteKeys.map((wk) => {
@@ -184,10 +184,19 @@ export const PianoKeyboardRow: React.FC<PianoKeyboardRowProps> = ({
                 aria-label={`Play note ${wk.label}`}
                 data-testid={`piano-key-${wk.label}`}
                 onPointerDown={(e) => {
-                  e.preventDefault();
-                  handlePressStart(wk.midi);
+                  if (e.pointerType === 'mouse') {
+                    e.preventDefault();
+                    handlePressStart(wk.midi);
+                  }
                 }}
-                onPointerUp={() => handlePressEnd(wk.midi)}
+                onPointerUp={(e) => {
+                  if (e.pointerType !== 'mouse') {
+                    handlePressStart(wk.midi);
+                    window.setTimeout(() => handlePressEnd(wk.midi), 140);
+                  } else {
+                    handlePressEnd(wk.midi);
+                  }
+                }}
                 onPointerLeave={() => handlePressEnd(wk.midi)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
@@ -230,11 +239,21 @@ export const PianoKeyboardRow: React.FC<PianoKeyboardRowProps> = ({
               data-testid={`piano-key-${bk.label}`}
               style={{ left: `${bk.leftPercent}%` }}
               onPointerDown={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                handlePressStart(bk.midi);
+                if (e.pointerType === 'mouse') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handlePressStart(bk.midi);
+                }
               }}
-              onPointerUp={() => handlePressEnd(bk.midi)}
+              onPointerUp={(e) => {
+                if (e.pointerType !== 'mouse') {
+                  e.stopPropagation();
+                  handlePressStart(bk.midi);
+                  window.setTimeout(() => handlePressEnd(bk.midi), 140);
+                } else {
+                  handlePressEnd(bk.midi);
+                }
+              }}
               onPointerLeave={() => handlePressEnd(bk.midi)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
@@ -264,7 +283,7 @@ export const PianoKeyboardRow: React.FC<PianoKeyboardRowProps> = ({
         })}
       </div>
 
-      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500">
+      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 pr-14 text-[11px] text-zinc-500 sm:pr-16">
         <span>
           Key guide: <span className="text-amber-400">Amber dot</span> = {rootKey} root ·{' '}
           <span className="text-emerald-400">Emerald dot</span> = in {rootKey} {scaleType} scale

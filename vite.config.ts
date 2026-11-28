@@ -25,6 +25,14 @@ export default defineConfig(() => {
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
           }
+          const srcBpModel = path.resolve(
+            __dirname,
+            'node_modules/@spotify/basic-pitch/model'
+          );
+          const distBpModel = path.resolve(distDir, 'basic-pitch-model');
+          if (fs.existsSync(distDir) && fs.existsSync(srcBpModel)) {
+            fs.cpSync(srcBpModel, distBpModel, {recursive: true, force: true});
+          }
         },
       },
     ],
@@ -34,6 +42,7 @@ export default defineConfig(() => {
       },
     },
     server: {
+      allowedHosts: true as const,
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',

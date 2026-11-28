@@ -24,7 +24,7 @@ import type {
   TapPresetOption,
 } from '../types/sequencer';
 import { TapBrowseModal } from './TapBrowseModal';
-import { getActiveStepCount } from '../utils/sequencerLogic';
+import { formatVolumeDb, getActiveStepCount } from '../utils/sequencerLogic';
 import {
   countActiveSteps,
   cutoffToSliderRatio,
@@ -57,9 +57,11 @@ interface TapLoopStudioProps {
   onSelectPreset: (padId: string, preset: TapPresetOption) => void;
   onReplacePadFile: (padId: string, file: File) => void;
   onTogglePadMute: (padId: string) => void;
+  onTogglePadSolo: (padId: string) => void;
   onClearPadSteps: (padId: string) => void;
   onClearAllPads: () => void;
   onPadReverbChange: (padId: string, reverb: number) => void;
+  onPadVolumeChange: (padId: string, db: number) => void;
   onTogglePadStep: (padId: string, stepIndex: number) => void;
   onSetPadStepVelocity: (padId: string, stepIndex: number, velocity: number) => void;
   onHumanizePad: (padId: string) => void;
@@ -114,9 +116,11 @@ export const TapLoopStudio: React.FC<TapLoopStudioProps> = ({
   onSelectPreset,
   onReplacePadFile,
   onTogglePadMute,
+  onTogglePadSolo,
   onClearPadSteps,
   onClearAllPads,
   onPadReverbChange,
+  onPadVolumeChange,
   onTogglePadStep,
   onSetPadStepVelocity,
   onHumanizePad,
@@ -608,6 +612,8 @@ export const TapLoopStudio: React.FC<TapLoopStudioProps> = ({
               const isFlashing = Boolean(flashingPadIds[pad.id]);
               const activeHits = countActiveSteps(pad.steps, loopBars);
               const hasSteps = activeHits > 0;
+              const anyPadSoloed = pads.some((p) => Boolean(p.soloed));
+              const isPadAudible = !pad.muted && (!anyPadSoloed || Boolean(pad.soloed));
               const isEmerald = pad.accentColor === 'emerald';
               const selectedPresetId =
                 TAP_PAD_PRESETS.find((p) => p.sample.url === pad.sample.url)?.id ?? 'custom';
@@ -621,12 +627,14 @@ export const TapLoopStudio: React.FC<TapLoopStudioProps> = ({
                       ? isEmerald
                         ? 'border-emerald-400 bg-emerald-500/15 shadow-[0_0_24px_rgba(16,185,129,0.28)]'
                         : 'border-amber-400 bg-amber-500/15 shadow-[0_0_24px_rgba(245,158,11,0.28)]'
-                      : hasSteps && !pad.muted
+                      : pad.soloed
+                      ? 'border-amber-400 bg-[#151310] shadow-[0_0_16px_rgba(245,158,11,0.16)]'
+                      : hasSteps && isPadAudible
                       ? isEmerald
                         ? 'border-emerald-500/45 bg-[#111316]'
                         : 'border-amber-500/45 bg-[#121216]'
                       : 'border-zinc-800 bg-[#0E0E12]'
-                  } ${pad.muted ? 'opacity-65' : ''}`}
+                  } ${!isPadAudible ? 'opacity-55' : ''}`}
                 >
                   {/* Top Strip */}
                   <div
@@ -643,6 +651,21 @@ export const TapLoopStudio: React.FC<TapLoopStudioProps> = ({
                     </div>
 
                     <div className="flex shrink-0 items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => onTogglePadSolo(pad.id)}
+                        aria-label={`Hear only ${pad.name}`}
+                        aria-pressed={Boolean(pad.soloed)}
+                        title={pad.soloed ? 'Playing only this pad (click for all)' : 'Hear only this pad'}
+                        className={`flex h-6 items-center justify-center rounded border px-1.5 text-[10px] font-bold transition-colors whitespace-nowrap ${
+                          pad.soloed
+                            ? 'border-amber-400 bg-amber-500 text-zinc-950'
+                            : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-amber-500/50 hover:text-amber-300'
+                        }`}
+                      >
+                        {pad.soloed ? 'Only On' : 'Only'}
+                      </button>
+
                       <button
                         type="button"
                         onClick={() => onTogglePadMute(pad.id)}
@@ -785,13 +808,34 @@ export const TapLoopStudio: React.FC<TapLoopStudioProps> = ({
                     </div>
                   </button>
 
-                  {/* Bottom Controls: Per-Pad Reverb, Preset & Replace Phone Audio */}
+                  {/* Bottom Controls: Per-Pad Volume, Reverb, Preset & Replace Phone Audio */}
                   <div
                     onPointerDown={(e) => e.stopPropagation()}
                     className="flex flex-col gap-1.5 border-t border-zinc-800/80 bg-zinc-950/70 p-2"
                   >
                     <div className="flex items-center gap-2 px-0.5">
-                      <span className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                      <span className="w-6 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                        Vol
+                      </span>
+                      <input
+                        type="range"
+                        min={-60}
+                        max={6}
+                        step={0.5}
+                        value={pad.volume_db}
+                        aria-label={`Volume for ${pad.name}`}
+                        onChange={(e) =>
+                          onPadVolumeChange(pad.id, Number(e.target.value))
+                        }
+                        className="studio-slider min-w-0 flex-1"
+                      />
+                      <span className="w-11 text-right font-mono-tabular text-[10px] text-zinc-300">
+                        {formatVolumeDb(pad.volume_db)}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-2 px-0.5">
+                      <span className="w-6 text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
                         Rev
                       </span>
                       <input
@@ -806,7 +850,7 @@ export const TapLoopStudio: React.FC<TapLoopStudioProps> = ({
                         }
                         className="studio-slider min-w-0 flex-1"
                       />
-                      <span className="w-8 text-right font-mono-tabular text-[10px] text-zinc-300">
+                      <span className="w-11 text-right font-mono-tabular text-[10px] text-zinc-300">
                         {Math.round(pad.reverb * 100)}%
                       </span>
                     </div>
@@ -980,28 +1024,60 @@ export const TapLoopStudio: React.FC<TapLoopStudioProps> = ({
               const isEmerald = pad.accentColor === 'emerald';
               const barSteps = pad.steps.slice(barStartStep, barStartStep + 16);
               const hasBarHits = barSteps.some((v) => v > 0);
+              const anyPadSoloed = pads.some((p) => Boolean(p.soloed));
+              const isPadAudible = !pad.muted && (!anyPadSoloed || Boolean(pad.soloed));
 
               return (
                 <div
                   key={`seq-${pad.id}`}
                   data-testid={`tap-seq-row-${idx + 1}`}
-                  className="space-y-2.5 px-3 py-3.5 sm:px-5"
+                  className={`space-y-2.5 px-3 py-3.5 sm:px-5 ${!isPadAudible ? 'opacity-55' : ''}`}
                 >
                   {/* Row Header */}
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex min-w-0 items-center gap-2">
-                      <span className="font-mono-tabular rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-bold text-zinc-300">
-                        {String(idx + 1).padStart(2, '0')}
-                      </span>
-                      <span className="truncate text-xs font-bold text-zinc-100 sm:text-sm">
-                        {pad.name}
-                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onTogglePadSolo(pad.id)}
+                        title={`Click to hear only ${pad.name}`}
+                        className={`flex min-w-0 items-center gap-2 rounded-md px-1.5 py-0.5 text-left transition-colors ${
+                          pad.soloed
+                            ? 'bg-amber-500/20 text-amber-200 ring-1 ring-amber-500/50'
+                            : 'hover:bg-zinc-900'
+                        }`}
+                      >
+                        <span className="font-mono-tabular rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-bold text-zinc-300">
+                          {String(idx + 1).padStart(2, '0')}
+                        </span>
+                        <span className="truncate text-xs font-bold text-zinc-100 sm:text-sm">
+                          {pad.name}
+                        </span>
+                      </button>
                       <span className="hidden text-[11px] text-zinc-500 sm:inline">
                         Tap or drag bars low/high to humanize dynamics
                       </span>
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex items-center gap-1.5 rounded border border-zinc-800 bg-zinc-950 px-2 py-1">
+                        <span className="text-[10px] font-semibold text-zinc-400">Vol</span>
+                        <input
+                          type="range"
+                          min={-60}
+                          max={6}
+                          step={0.5}
+                          value={pad.volume_db}
+                          aria-label={`Sequencer volume for ${pad.name}`}
+                          onChange={(e) =>
+                            onPadVolumeChange(pad.id, Number(e.target.value))
+                          }
+                          className="studio-slider w-14 sm:w-20"
+                        />
+                        <span className="w-11 text-right font-mono-tabular text-[10px] text-zinc-300">
+                          {formatVolumeDb(pad.volume_db)}
+                        </span>
+                      </div>
+
                       <div className="flex items-center gap-1.5 rounded border border-zinc-800 bg-zinc-950 px-2 py-1">
                         <span className="text-[10px] font-semibold text-zinc-400">Rev</span>
                         <input
@@ -1029,6 +1105,20 @@ export const TapLoopStudio: React.FC<TapLoopStudioProps> = ({
                       >
                         <Sparkles className="h-3 w-3" />
                         <span>Humanize</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => onTogglePadSolo(pad.id)}
+                        aria-label={`Hear only ${pad.name} sequence`}
+                        aria-pressed={Boolean(pad.soloed)}
+                        className={`h-7 rounded border px-2 font-mono-tabular text-[11px] font-bold transition-colors whitespace-nowrap ${
+                          pad.soloed
+                            ? 'border-amber-400 bg-amber-500 text-zinc-950'
+                            : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-amber-500/50 hover:text-amber-300'
+                        }`}
+                      >
+                        {pad.soloed ? 'Only On' : 'Hear Only'}
                       </button>
 
                       <button

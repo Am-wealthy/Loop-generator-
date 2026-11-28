@@ -11,6 +11,7 @@ import type {
   TapPad,
 } from '../types/sequencer';
 import {
+  buildFallbackWaveformPeaks,
   clampBpm,
   dbToGain,
   encodeRepeatedStereoWavBlob,
@@ -18,6 +19,7 @@ import {
   getStepDurationSeconds,
   isTrackAudible,
   MAX_UPLOAD_DURATION_SECONDS,
+  shouldStreamAudioFile,
 } from '../utils/sequencerLogic';
 import {
   clampCutoffHz,
@@ -25,17 +27,62 @@ import {
   clampUnit,
   DEFAULT_TAP_LOOP_SETTINGS,
   getReverbDecaySeconds,
+  isTapPadAudible,
   snapStepFromTiming,
 } from '../utils/tapLoopLogic';
-import { midiToFreq } from '../utils/stemBuilderLogic';
+import {
+  getChannelTimelineSteps,
+  getSongTimelineSteps,
+  isAnyStemSoloed,
+  isStemChannelAudible,
+  isStemLoopAudible,
+  midiToFreq,
+} from '../utils/stemBuilderLogic';
 
 const LOOKAHEAD_MS = 22; // Tight low-latency scheduler interval
 const SCHEDULE_AHEAD_SEC = 0.085; // 85ms lookahead window
+const SAMPLE_FETCH_TIMEOUT_MS = 2500;
+
+function createSilentWavDataUri(durationSeconds = 0.5): string {
+  const sampleRate = 8000;
+  const numFrames = Math.max(1, Math.floor(sampleRate * durationSeconds));
+  const dataSize = numFrames * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeStr = (offset: number, s: string) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+  };
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataSize, true);
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return `data:audio/wav;base64,${btoa(binary)}`;
+}
+
+const SILENT_LOOP_WAV_DATA_URI = createSilentWavDataUri(0.5);
 
 export class StudioAudioEngine {
   private ctx: AudioContext | null = null;
+  private masterCompressor: DynamicsCompressorNode | null = null;
+  private masterGain: GainNode | null = null;
   private percussionBus: GainNode | null = null;
   private originalBus: GainNode | null = null;
+  private silentKeepaliveEl: HTMLAudioElement | null = null;
+  private fallbackBufferCache = new Map<string, AudioBuffer>();
 
   // Tap Loop FX graph:
   // Dry Pad -> tapMasterFilter -> percussionBus
@@ -69,9 +116,21 @@ export class StudioAudioEngine {
   private stemChannels: StemChannel[] = [];
   private stemLoopSource: StemLoopSource = 'sequencer';
   private stemLoopMuted = false;
+  private stemLoopSoloed = false;
   private stemLoopVolumeDb = -2;
   private stemHumBuffers = new Map<string, AudioBuffer>();
-  private activeHumSources: AudioBufferSourceNode[] = [];
+  private activeHumSources: Array<{ channelId: string; src: AudioBufferSourceNode }> = [];
+  private activeHumGains: Array<{ channelId: string; gain: GainNode }> = [];
+  private humPreviewSource: AudioBufferSourceNode | null = null;
+  private stemPhoneLoopBuffer: AudioBuffer | null = null;
+  private stemPhoneLoopSource: AudioBufferSourceNode | null = null;
+  private stemPhoneLoopGain: GainNode | null = null;
+  private stemPhoneLoopEl: HTMLAudioElement | null = null;
+  private stemPhoneLoopObjectUrl: string | null = null;
+
+  // Hum recording isolation state
+  private isRecordingHum = false;
+  private muteBackingWhileHum = false;
 
   private bpm = 126;
   private loopBars: LoopBars = 4;
@@ -80,6 +139,7 @@ export class StudioAudioEngine {
 
   private onStepCallback: ((step: number) => void) | null = null;
   private onTapPadTriggerCallback: ((padId: string) => void) | null = null;
+  private onAudioStateChangeCallback: ((state: AudioContextState) => void) | null = null;
 
   private buildReverbImpulse(
     ctx: BaseAudioContext,
@@ -114,10 +174,29 @@ export class StudioAudioEngine {
       this.ctx = new AudioCtx({
         latencyHint: 'interactive',
       });
+      this.ctx.addEventListener('statechange', () => {
+        if (this.ctx && this.onAudioStateChangeCallback) {
+          this.onAudioStateChangeCallback(this.ctx.state);
+        }
+      });
+
+      this.masterCompressor = this.ctx.createDynamicsCompressor();
+      this.masterCompressor.threshold.value = -12;
+      this.masterCompressor.knee.value = 12;
+      this.masterCompressor.ratio.value = 4;
+      this.masterCompressor.attack.value = 0.003;
+      this.masterCompressor.release.value = 0.14;
+
+      this.masterGain = this.ctx.createGain();
+      this.masterGain.gain.value = 1.1;
+
       this.percussionBus = this.ctx.createGain();
       this.originalBus = this.ctx.createGain();
-      this.percussionBus.connect(this.ctx.destination);
-      this.originalBus.connect(this.ctx.destination);
+
+      this.percussionBus.connect(this.masterCompressor);
+      this.originalBus.connect(this.masterCompressor);
+      this.masterCompressor.connect(this.masterGain);
+      this.masterGain.connect(this.ctx.destination);
 
       this.tapMasterFilter = this.ctx.createBiquadFilter();
       this.tapMasterFilter.type = 'lowpass';
@@ -143,10 +222,138 @@ export class StudioAudioEngine {
     return this.ctx;
   }
 
-  public async resume(): Promise<void> {
+  /**
+   * Synchronously unlocks Web Audio & mobile/iOS audio session inside a user gesture
+   * (pointerdown/touchstart/click/keydown) without waiting on promises or network calls.
+   */
+  public unlockSync(): AudioContext {
+    try {
+      const nav = navigator as unknown as {
+        audioSession?: { type?: string };
+      };
+      if (nav.audioSession && nav.audioSession.type !== 'playback') {
+        nav.audioSession.type = 'playback';
+      }
+    } catch {
+      // Ignore unsupported audioSession API
+    }
+
     const ctx = this.ensureContext();
-    if (ctx.state === 'suspended') {
-      await ctx.resume();
+    if (ctx.state !== 'running') {
+      void ctx
+        .resume()
+        .then(() => {
+          if (this.onAudioStateChangeCallback) {
+            this.onAudioStateChangeCallback(ctx.state);
+          }
+        })
+        .catch(() => undefined);
+    }
+
+    // Play a 1-sample silent buffer synchronously inside gesture to unlock iOS/Safari/iframe audio
+    try {
+      const silentBuf = ctx.createBuffer(1, 1, ctx.sampleRate);
+      const silentSrc = ctx.createBufferSource();
+      silentSrc.buffer = silentBuf;
+      silentSrc.connect(ctx.destination);
+      silentSrc.start(0);
+    } catch {
+      // Ignore if context is closed
+    }
+
+    // Prime continuous looping silent HTMLAudioElement inside user gesture so iOS/mobile
+    // routes Web Audio through Media Playback even when hardware mute switch is on or in an iframe.
+    try {
+      if (!this.silentKeepaliveEl) {
+        const el = new Audio(SILENT_LOOP_WAV_DATA_URI);
+        el.loop = true;
+        el.preload = 'auto';
+        el.volume = 0.01;
+        el.setAttribute('playsinline', 'true');
+        el.setAttribute('webkit-playsinline', 'true');
+        this.silentKeepaliveEl = el;
+      }
+      if (this.silentKeepaliveEl.paused) {
+        void this.silentKeepaliveEl.play().catch(() => undefined);
+      }
+    } catch {
+      // Ignore
+    }
+
+    if (this.onAudioStateChangeCallback) {
+      this.onAudioStateChangeCallback(ctx.state);
+    }
+    return ctx;
+  }
+
+  public getSharedAudioContext(): AudioContext {
+    return this.ensureContext();
+  }
+
+  public async resumeAfterMicStart(): Promise<void> {
+    const ctx = this.ensureContext();
+    if (ctx.state !== 'running') {
+      try {
+        await ctx.resume();
+      } catch {
+        // Ignore if still blocked
+      }
+    }
+    if (this.isPlaying && this.silentKeepaliveEl && this.silentKeepaliveEl.paused) {
+      try {
+        void this.silentKeepaliveEl.play().catch(() => undefined);
+      } catch {
+        // Ignore
+      }
+    }
+    if (this.onAudioStateChangeCallback) {
+      this.onAudioStateChangeCallback(ctx.state);
+    }
+  }
+
+  private getEffectiveStemSongSteps(): number {
+    const percStepCount = getActiveStepCount(this.loopBars);
+    return this.engineMode === 'stems'
+      ? getSongTimelineSteps(this.stemChannels, percStepCount)
+      : percStepCount;
+  }
+
+  public setHumRecordingState(active: boolean, muteBackingWhileHum = false): void {
+    const wasActive = this.isRecordingHum;
+    this.isRecordingHum = active;
+    this.muteBackingWhileHum = muteBackingWhileHum;
+    if (active) {
+      this.stopActiveHumSources();
+      if (!wasActive && this.isPlaying) {
+        this.currentStep = 0;
+      }
+    } else if (wasActive && this.isPlaying) {
+      const songSteps = this.getEffectiveStemSongSteps();
+      this.currentStep = this.currentStep % Math.max(1, songSteps);
+    }
+    this.applyBlend();
+    this.syncStemLoopOutputs();
+  }
+
+  public getAudioContextState(): AudioContextState | 'uninitialized' {
+    return this.ctx ? this.ctx.state : 'uninitialized';
+  }
+
+  public setOnAudioStateChange(cb: (state: AudioContextState) => void): void {
+    this.onAudioStateChangeCallback = cb;
+  }
+
+  public async resume(): Promise<void> {
+    const ctx = this.unlockSync();
+    if (ctx.state !== 'running') {
+      try {
+        await ctx.resume();
+      } catch {
+        // Ignore if blocked before gesture
+      }
+    }
+    if (this.onAudioStateChangeCallback) {
+      this.onAudioStateChangeCallback(ctx.state);
     }
   }
 
@@ -195,16 +402,305 @@ export class StudioAudioEngine {
     this.applyTapSettingsToAudioNodes();
   }
 
+  private computeEffectiveStemLoopGain(): number {
+    const audible = isStemLoopAudible(
+      this.stemLoopMuted,
+      this.stemLoopSoloed,
+      this.stemChannels
+    );
+    if (!audible) return 0;
+    if (this.isRecordingHum && this.muteBackingWhileHum) return 0;
+    const base = dbToGain(this.stemLoopVolumeDb);
+    // Duck Row 1 loop gently while humming so speaker bleed doesn't drown the vocal mic
+    return this.isRecordingHum ? base * 0.22 : base;
+  }
+
+  private syncStemLoopOutputs(): void {
+    const targetGain = this.computeEffectiveStemLoopGain();
+    if (this.ctx && this.stemPhoneLoopGain) {
+      this.stemPhoneLoopGain.gain.setTargetAtTime(targetGain, this.ctx.currentTime, 0.018);
+    }
+    if (this.stemPhoneLoopEl) {
+      const shouldSilenceEl =
+        this.engineMode !== 'stems' ||
+        this.stemLoopSource !== 'phone_audio' ||
+        targetGain <= 0.001;
+      this.stemPhoneLoopEl.muted = shouldSilenceEl;
+      this.stemPhoneLoopEl.volume = shouldSilenceEl
+        ? 0
+        : Math.max(0, Math.min(1, targetGain));
+    }
+  }
+
   public updateStemState(params: {
     stemChannels: StemChannel[];
     stemLoopSource: StemLoopSource;
     stemLoopMuted: boolean;
+    stemLoopSoloed?: boolean;
     stemLoopVolumeDb: number;
   }): void {
+    const prevSource = this.stemLoopSource;
     this.stemChannels = params.stemChannels;
     this.stemLoopSource = params.stemLoopSource;
     this.stemLoopMuted = params.stemLoopMuted;
+    this.stemLoopSoloed = Boolean(params.stemLoopSoloed);
     this.stemLoopVolumeDb = params.stemLoopVolumeDb;
+    if (this.isPlaying && this.engineMode === 'stems' && prevSource !== this.stemLoopSource) {
+      if (this.stemLoopSource === 'phone_audio') {
+        this.startStemPhoneLoopSource((this.ctx?.currentTime ?? 0) + 0.01);
+      } else {
+        this.stopStemPhoneLoopSource();
+      }
+    }
+    if (this.ctx && this.activeHumGains.length > 0) {
+      const now = this.ctx.currentTime;
+      for (const entry of this.activeHumGains) {
+        const ch = this.stemChannels.find((c) => c.id === entry.channelId);
+        const audible =
+          Boolean(ch) &&
+          !this.isRecordingHum &&
+          isStemChannelAudible(ch!, this.stemLoopSoloed, this.stemChannels);
+        const target = audible && ch ? dbToGain(ch.volume_db) : 0;
+        entry.gain.gain.setTargetAtTime(target, now, 0.015);
+      }
+    }
+    this.syncStemLoopOutputs();
+  }
+
+  private async probeAudioMetadata(file: File): Promise<{
+    ok: boolean;
+    durationSeconds: number;
+    element: HTMLAudioElement;
+    objectUrl: string;
+  }> {
+    const objectUrl = URL.createObjectURL(file);
+    const audioEl = new Audio(objectUrl);
+    audioEl.loop = true;
+    audioEl.preload = 'metadata';
+    audioEl.setAttribute('playsinline', 'true');
+    audioEl.setAttribute('webkit-playsinline', 'true');
+    audioEl.addEventListener('timeupdate', () => {
+      if (audioEl.currentTime >= MAX_UPLOAD_DURATION_SECONDS) {
+        audioEl.currentTime = 0;
+      }
+    });
+
+    const ok = await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timer);
+        audioEl.removeEventListener('loadedmetadata', onOk);
+        audioEl.removeEventListener('loadeddata', onOk);
+        audioEl.removeEventListener('canplay', onOk);
+        audioEl.removeEventListener('error', onErr);
+        resolve(result);
+      };
+      const onOk = () => done(true);
+      const onErr = () => done(false);
+      const timer = window.setTimeout(() => done(false), 2600);
+      audioEl.addEventListener('loadedmetadata', onOk);
+      audioEl.addEventListener('loadeddata', onOk);
+      audioEl.addEventListener('canplay', onOk);
+      audioEl.addEventListener('error', onErr);
+      audioEl.load();
+    });
+
+    const rawDur = Number.isFinite(audioEl.duration) ? audioEl.duration : 0;
+    return { ok, durationSeconds: rawDur, element: audioEl, objectUrl };
+  }
+
+  private hasId3v2Header(buffer: ArrayBuffer): boolean {
+    if (buffer.byteLength < 10) return false;
+    const b = new Uint8Array(buffer, 0, 3);
+    return b[0] === 0x49 && b[1] === 0x44 && b[2] === 0x33;
+  }
+
+  public async loadStemPhoneLoopFile(file: File): Promise<{
+    durationSeconds: number;
+    peaks: number[];
+  }> {
+    if (!file || file.size <= 0) {
+      throw new Error('Selected audio file appears empty. Please pick another loop.');
+    }
+
+    this.clearStemPhoneLoop();
+    const ctx = this.ensureContext();
+    if (ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch {
+        // Ignore deferred autoplay resume
+      }
+    }
+
+    const probe = await this.probeAudioMetadata(file);
+    const shouldStream = shouldStreamAudioFile(
+      file.size,
+      probe.durationSeconds,
+      6 * 1024 * 1024,
+      90
+    );
+
+    if (shouldStream && probe.ok) {
+      this.stemPhoneLoopEl = probe.element;
+      this.stemPhoneLoopObjectUrl = probe.objectUrl;
+      this.syncStemLoopOutputs();
+      if (this.isPlaying && this.engineMode === 'stems' && this.stemLoopSource === 'phone_audio') {
+        this.startStemPhoneLoopSource(ctx.currentTime + 0.01);
+      }
+      return {
+        durationSeconds: Math.min(
+          probe.durationSeconds > 0 ? probe.durationSeconds : 30,
+          MAX_UPLOAD_DURATION_SECONDS
+        ),
+        peaks: buildFallbackWaveformPeaks(48, file.name.length),
+      };
+    }
+
+    let decoded: AudioBuffer | null = null;
+    if (!shouldStream) {
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const maybeStripped = this.hasId3v2Header(arrayBuffer)
+          ? this.stripId3v2IfPresent(arrayBuffer)
+          : null;
+        try {
+          decoded = await ctx.decodeAudioData(arrayBuffer);
+        } catch {
+          if (maybeStripped) {
+            decoded = await ctx.decodeAudioData(maybeStripped);
+          }
+        }
+      } catch {
+        decoded = null;
+      }
+    }
+
+    if (decoded) {
+      URL.revokeObjectURL(probe.objectUrl);
+      probe.element.src = '';
+
+      const trimmed = this.trimBufferToMaxDuration(ctx, decoded);
+      this.stemPhoneLoopBuffer = trimmed.buffer;
+
+      const chan = trimmed.buffer.getChannelData(0);
+      const binCount = 48;
+      const blockSize = Math.max(1, Math.floor(chan.length / binCount));
+      const step = Math.max(4, Math.floor(blockSize / 32));
+      const peaks: number[] = [];
+      let maxPeak = 0.001;
+      for (let i = 0; i < binCount; i++) {
+        const start = i * blockSize;
+        const end = Math.min(chan.length, start + blockSize);
+        let pk = 0;
+        for (let j = start; j < end; j += step) {
+          const a = Math.abs(chan[j]);
+          if (a > pk) pk = a;
+        }
+        if (pk > maxPeak) maxPeak = pk;
+        peaks.push(pk);
+      }
+      if (this.isPlaying && this.engineMode === 'stems' && this.stemLoopSource === 'phone_audio') {
+        this.startStemPhoneLoopSource(ctx.currentTime + 0.01);
+      }
+      return {
+        durationSeconds: trimmed.durationSeconds,
+        peaks: peaks.map((p) => p / maxPeak),
+      };
+    }
+
+    // Fallback to streaming HTMLAudioElement when mobile codec fails Web Audio decodeAudioData
+    if (probe.ok) {
+      this.stemPhoneLoopEl = probe.element;
+      this.stemPhoneLoopObjectUrl = probe.objectUrl;
+      this.syncStemLoopOutputs();
+      if (this.isPlaying && this.engineMode === 'stems' && this.stemLoopSource === 'phone_audio') {
+        this.startStemPhoneLoopSource(ctx.currentTime + 0.01);
+      }
+      return {
+        durationSeconds: Math.min(
+          probe.durationSeconds > 0 ? probe.durationSeconds : 30,
+          MAX_UPLOAD_DURATION_SECONDS
+        ),
+        peaks: buildFallbackWaveformPeaks(48, file.name.length),
+      };
+    }
+
+    URL.revokeObjectURL(probe.objectUrl);
+    probe.element.src = '';
+    throw new Error('Could not load this loop file. Please try WAV, MP3, M4A, or AAC.');
+  }
+
+  public clearStemPhoneLoop(): void {
+    this.stopStemPhoneLoopSource();
+    this.stemPhoneLoopBuffer = null;
+    if (this.stemPhoneLoopEl) {
+      this.stemPhoneLoopEl.pause();
+      this.stemPhoneLoopEl.src = '';
+      this.stemPhoneLoopEl = null;
+    }
+    if (this.stemPhoneLoopObjectUrl) {
+      URL.revokeObjectURL(this.stemPhoneLoopObjectUrl);
+      this.stemPhoneLoopObjectUrl = null;
+    }
+  }
+
+  private startStemPhoneLoopSource(when: number): void {
+    this.stopStemPhoneLoopSource();
+    if (this.engineMode !== 'stems' || this.stemLoopSource !== 'phone_audio') {
+      return;
+    }
+    if (this.stemPhoneLoopBuffer) {
+      const ctx = this.ensureContext();
+      const src = ctx.createBufferSource();
+      src.buffer = this.stemPhoneLoopBuffer;
+      src.loop = true;
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(this.computeEffectiveStemLoopGain(), when);
+      src.connect(gain);
+      gain.connect(this.percussionBus ?? ctx.destination);
+      src.start(when);
+      this.stemPhoneLoopSource = src;
+      this.stemPhoneLoopGain = gain;
+    } else if (this.stemPhoneLoopEl) {
+      this.syncStemLoopOutputs();
+      this.stemPhoneLoopEl.currentTime = 0;
+      void this.stemPhoneLoopEl.play().catch(() => undefined);
+    }
+  }
+
+  private stopStemPhoneLoopSource(): void {
+    if (this.stemPhoneLoopSource) {
+      try {
+        this.stemPhoneLoopSource.stop();
+        this.stemPhoneLoopSource.disconnect();
+      } catch {
+        // Already stopped
+      }
+      this.stemPhoneLoopSource = null;
+    }
+    if (this.stemPhoneLoopGain) {
+      try {
+        this.stemPhoneLoopGain.disconnect();
+      } catch {
+        // Ignore
+      }
+      this.stemPhoneLoopGain = null;
+    }
+    if (this.stemPhoneLoopEl && !this.stemPhoneLoopEl.paused) {
+      try {
+        this.stemPhoneLoopEl.pause();
+        this.stemPhoneLoopEl.currentTime = 0;
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  public setStemHumAudioBuffer(channelId: string, buffer: AudioBuffer): void {
+    this.stemHumBuffers.set(channelId, buffer);
   }
 
   public async loadStemHumAudio(channelId: string, blob: Blob): Promise<void> {
@@ -215,7 +711,60 @@ export class StudioAudioEngine {
   }
 
   public clearStemHumAudio(channelId: string): void {
+    this.stopActiveHumSourcesForChannel(channelId);
     this.stemHumBuffers.delete(channelId);
+  }
+
+  public async playStemHumPreview(channelId: string): Promise<boolean> {
+    const ctx = this.unlockSync();
+    if (ctx.state !== 'running') {
+      await this.resume();
+    }
+    this.stopStemHumPreview();
+    const humBuf = this.stemHumBuffers.get(channelId);
+    if (!humBuf) return false;
+
+    // Skip leading silence when previewing standalone so Bar 2/3 hums play immediately,
+    // while keeping full loop-aligned silence at offset 0 for in-time beat playback.
+    let offsetSec = 0;
+    const chan = humBuf.getChannelData(0);
+    let firstActive = -1;
+    for (let i = 0; i < chan.length; i++) {
+      if (Math.abs(chan[i]) > 0.008) {
+        firstActive = i;
+        break;
+      }
+    }
+    if (firstActive > 0) {
+      offsetSec = Math.max(0, firstActive / humBuf.sampleRate - 0.02);
+    }
+
+    const src = ctx.createBufferSource();
+    src.buffer = humBuf;
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(1.0, ctx.currentTime);
+    src.connect(gain);
+    gain.connect(this.percussionBus ?? ctx.destination);
+    src.onended = () => {
+      if (this.humPreviewSource === src) {
+        this.humPreviewSource = null;
+      }
+    };
+    src.start(ctx.currentTime + 0.01, offsetSec);
+    this.humPreviewSource = src;
+    return true;
+  }
+
+  public stopStemHumPreview(): void {
+    if (this.humPreviewSource) {
+      try {
+        this.humPreviewSource.stop();
+        this.humPreviewSource.disconnect();
+      } catch {
+        // Already stopped
+      }
+      this.humPreviewSource = null;
+    }
   }
 
   public getCurrentPlaybackTiming(): {
@@ -225,6 +774,8 @@ export class StudioAudioEngine {
     stepDuration: number;
     stepCount: number;
     ctxCurrentTime: number;
+    baseLatency: number;
+    outputLatency: number;
   } {
     const ctx = this.ensureContext();
     return {
@@ -232,8 +783,10 @@ export class StudioAudioEngine {
       currentStep: this.currentStep,
       nextStepTime: this.nextStepTime,
       stepDuration: getStepDurationSeconds(this.bpm),
-      stepCount: getActiveStepCount(this.loopBars),
+      stepCount: this.getEffectiveStemSongSteps(),
       ctxCurrentTime: ctx.currentTime,
+      baseLatency: typeof ctx.baseLatency === 'number' ? ctx.baseLatency : 0,
+      outputLatency: typeof ctx.outputLatency === 'number' ? ctx.outputLatency : 0,
     };
   }
 
@@ -269,7 +822,10 @@ export class StudioAudioEngine {
     const percGain =
       this.blendRatio <= 0.5 ? 1 : Math.max(0.2, 1 - (this.blendRatio - 0.5) * 1.6);
     const hasOrig = Boolean(this.originalBuffer || this.fallbackAudioEl);
-    const origGain = hasOrig ? Math.min(1, this.blendRatio * 1.35) : 0;
+    const silenceOrigForHum =
+      this.isRecordingHum && (this.muteBackingWhileHum || this.engineMode === 'stems');
+    const origGain =
+      hasOrig && !silenceOrigForHum ? Math.min(1, this.blendRatio * 1.35) : 0;
 
     if (this.fallbackAudioEl) {
       this.fallbackAudioEl.volume = Math.max(0, Math.min(1, origGain));
@@ -336,6 +892,15 @@ export class StudioAudioEngine {
     durationSeconds: number;
   }> {
     this.clearUploadedAudio();
+    if (!file || file.size <= 0) {
+      return {
+        buffer: null,
+        playableViaElement: false,
+        wasTrimmed: false,
+        durationSeconds: 0,
+      };
+    }
+
     const ctx = this.ensureContext();
     if (ctx.state === 'suspended') {
       try {
@@ -345,24 +910,31 @@ export class StudioAudioEngine {
       }
     }
 
-    const arrayBuffer = await file.arrayBuffer();
+    const probe = await this.probeAudioMetadata(file);
+    const shouldStream = shouldStreamAudioFile(
+      file.size,
+      probe.durationSeconds,
+      8 * 1024 * 1024,
+      120
+    );
 
-    try {
-      const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
-      const trimmed = this.trimBufferToMaxDuration(ctx, decoded);
-      this.originalBuffer = trimmed.buffer;
-      this.applyBlend();
-      return {
-        buffer: trimmed.buffer,
-        playableViaElement: false,
-        wasTrimmed: trimmed.wasTrimmed,
-        durationSeconds: trimmed.durationSeconds,
-      };
-    } catch {
-      const stripped = this.stripId3v2IfPresent(arrayBuffer);
-      if (stripped) {
+    if (!shouldStream) {
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const maybeStripped = this.hasId3v2Header(arrayBuffer)
+          ? this.stripId3v2IfPresent(arrayBuffer)
+          : null;
+        let decoded: AudioBuffer | null = null;
         try {
-          const decoded = await ctx.decodeAudioData(stripped);
+          decoded = await ctx.decodeAudioData(arrayBuffer);
+        } catch {
+          if (maybeStripped) {
+            decoded = await ctx.decodeAudioData(maybeStripped);
+          }
+        }
+        if (decoded) {
+          URL.revokeObjectURL(probe.objectUrl);
+          probe.element.src = '';
           const trimmed = this.trimBufferToMaxDuration(ctx, decoded);
           this.originalBuffer = trimmed.buffer;
           this.applyBlend();
@@ -372,47 +944,17 @@ export class StudioAudioEngine {
             wasTrimmed: trimmed.wasTrimmed,
             durationSeconds: trimmed.durationSeconds,
           };
-        } catch {
-          // Proceed to HTMLAudioElement fallback
         }
+      } catch {
+        // Fall through to HTMLAudioElement streaming
       }
     }
 
-    const objectUrl = URL.createObjectURL(file);
-    const audioEl = new Audio(objectUrl);
-    audioEl.loop = true;
-    audioEl.preload = 'metadata';
-    audioEl.addEventListener('timeupdate', () => {
-      if (audioEl.currentTime >= MAX_UPLOAD_DURATION_SECONDS) {
-        audioEl.currentTime = 0;
-      }
-    });
-
-    const canPlay = await new Promise<boolean>((resolve) => {
-      let settled = false;
-      const done = (ok: boolean) => {
-        if (settled) return;
-        settled = true;
-        window.clearTimeout(timer);
-        audioEl.removeEventListener('loadedmetadata', onOk);
-        audioEl.removeEventListener('canplay', onOk);
-        audioEl.removeEventListener('error', onErr);
-        resolve(ok);
-      };
-      const onOk = () => done(true);
-      const onErr = () => done(false);
-      const timer = window.setTimeout(() => done(false), 1800);
-      audioEl.addEventListener('loadedmetadata', onOk);
-      audioEl.addEventListener('canplay', onOk);
-      audioEl.addEventListener('error', onErr);
-      audioEl.load();
-    });
-
-    if (canPlay) {
-      this.fallbackObjectUrl = objectUrl;
-      this.fallbackAudioEl = audioEl;
+    if (probe.ok) {
+      this.fallbackObjectUrl = probe.objectUrl;
+      this.fallbackAudioEl = probe.element;
       this.applyBlend();
-      const rawDur = Number.isFinite(audioEl.duration) ? audioEl.duration : 0;
+      const rawDur = probe.durationSeconds;
       return {
         buffer: null,
         playableViaElement: true,
@@ -421,7 +963,8 @@ export class StudioAudioEngine {
       };
     }
 
-    URL.revokeObjectURL(objectUrl);
+    URL.revokeObjectURL(probe.objectUrl);
+    probe.element.src = '';
     this.applyBlend();
     return {
       buffer: null,
@@ -526,6 +1069,13 @@ export class StudioAudioEngine {
   }
 
   public async loadTapPadFile(padId: string, file: File): Promise<SampleCandidate> {
+    if (!file || file.size <= 0) {
+      throw new Error('Selected pad audio file appears empty.');
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      throw new Error('One-shot pad samples must be under 8 MB. Use Stem Studio Row 1 for full phone loops.');
+    }
+
     const ctx = this.ensureContext();
     if (ctx.state === 'suspended') {
       try {
@@ -535,16 +1085,25 @@ export class StudioAudioEngine {
       }
     }
 
+    const probe = await this.probeAudioMetadata(file);
+    URL.revokeObjectURL(probe.objectUrl);
+    probe.element.src = '';
+    if (probe.durationSeconds > 20) {
+      throw new Error('Pad hits should be under 20 seconds. Upload full loops in Stem Studio Row 1.');
+    }
+
     const arrayBuffer = await file.arrayBuffer();
+    const maybeStripped = this.hasId3v2Header(arrayBuffer)
+      ? this.stripId3v2IfPresent(arrayBuffer)
+      : null;
     let decoded: AudioBuffer | null = null;
 
     try {
-      decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
+      decoded = await ctx.decodeAudioData(arrayBuffer);
     } catch {
-      const stripped = this.stripId3v2IfPresent(arrayBuffer);
-      if (stripped) {
+      if (maybeStripped) {
         try {
-          decoded = await ctx.decodeAudioData(stripped);
+          decoded = await ctx.decodeAudioData(maybeStripped);
         } catch {
           decoded = null;
         }
@@ -566,6 +1125,35 @@ export class StudioAudioEngine {
       url: customUrl,
       source: 'custom',
     };
+  }
+
+  private getOrCreateFallbackBuffer(
+    targetCtx: BaseAudioContext,
+    instrumentId: string
+  ): AudioBuffer {
+    const key = `fallback://${instrumentId}@${targetCtx.sampleRate}`;
+    const existing = this.fallbackBufferCache.get(key);
+    if (existing) return existing;
+    const created = this.createClickOrPercSynthBuffer(targetCtx, instrumentId);
+    this.fallbackBufferCache.set(key, created);
+    return created;
+  }
+
+  private ensureClickBuffersCached(targetCtx: BaseAudioContext): void {
+    const hiKey = `synth://click_hi@${targetCtx.sampleRate}`;
+    if (!this.sampleCache.has(hiKey)) {
+      this.sampleCache.set(
+        hiKey,
+        this.createClickOrPercSynthBuffer(targetCtx, 'click_hi')
+      );
+    }
+    const loKey = `synth://click_lo@${targetCtx.sampleRate}`;
+    if (!this.sampleCache.has(loKey)) {
+      this.sampleCache.set(
+        loKey,
+        this.createClickOrPercSynthBuffer(targetCtx, 'click_lo')
+      );
+    }
   }
 
   public async loadSampleBuffer(
@@ -600,18 +1188,24 @@ export class StudioAudioEngine {
     if (inFlight) return inFlight;
 
     const promise = (async () => {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(
+        () => controller.abort(),
+        SAMPLE_FETCH_TIMEOUT_MS
+      );
       try {
-        const res = await fetch(sample.url);
+        const res = await fetch(sample.url, { signal: controller.signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.arrayBuffer();
         const decoded = await targetCtx.decodeAudioData(data);
         this.sampleCache.set(cacheKey, decoded);
         return decoded;
       } catch {
-        const fallback = this.createClickOrPercSynthBuffer(targetCtx, instrumentId);
+        const fallback = this.getOrCreateFallbackBuffer(targetCtx, instrumentId);
         this.sampleCache.set(cacheKey, fallback);
         return fallback;
       } finally {
+        window.clearTimeout(timeoutId);
         this.pendingLoads.delete(cacheKey);
       }
     })();
@@ -702,12 +1296,18 @@ export class StudioAudioEngine {
   }
 
   public async triggerPreview(track: PercussionTrack): Promise<void> {
-    await this.resume();
-    const ctx = this.ensureContext();
+    const ctx = this.unlockSync();
     const sample = track.samples?.[track.activeSampleIndex ?? 0];
     if (!sample || !this.percussionBus) return;
-    const buffer = await this.loadSampleBuffer(ctx, sample, track.instrument_id);
-    this.triggerBufferAt(ctx, this.percussionBus, buffer, track, 95, ctx.currentTime + 0.005);
+    const cacheKey = `${sample.url}@${ctx.sampleRate}`;
+    const cached = this.sampleCache.get(cacheKey);
+    if (cached) {
+      this.triggerBufferAt(ctx, this.percussionBus, cached, track, 95, ctx.currentTime + 0.005);
+      return;
+    }
+    const immediate = this.getOrCreateFallbackBuffer(ctx, track.instrument_id);
+    this.triggerBufferAt(ctx, this.percussionBus, immediate, track, 95, ctx.currentTime + 0.005);
+    void this.loadSampleBuffer(ctx, sample, track.instrument_id);
   }
 
   /**
@@ -722,7 +1322,7 @@ export class StudioAudioEngine {
     wasPlaying: boolean;
     tapCtxTime: number;
   }> {
-    const ctx = this.ensureContext();
+    const ctx = this.unlockSync();
     const tapCtxTime = ctx.currentTime;
     const stepCount = getActiveStepCount(this.loopBars);
     const stepDuration = getStepDurationSeconds(this.bpm);
@@ -745,34 +1345,41 @@ export class StudioAudioEngine {
       });
     }
 
-    const playLoaded = async () => {
-      try {
-        if (ctx.state === 'suspended') {
-          await ctx.resume();
-        }
-      } catch {
-        // Autoplay policy may block untrusted events; step recording still succeeds
-      }
-      const cacheKey = `${pad.sample.url}@${ctx.sampleRate}`;
-      const cached =
-        this.customTapBuffers.get(pad.sample.url) ?? this.sampleCache.get(cacheKey);
-      const buffer = cached ?? (await this.loadSampleBuffer(ctx, pad.sample, pad.id));
+    const cacheKey = `${pad.sample.url}@${ctx.sampleRate}`;
+    const cached =
+      this.customTapBuffers.get(pad.sample.url) ?? this.sampleCache.get(cacheKey);
 
-      if (this.tapMasterFilter) {
-        this.triggerTapPadWithFx(
-          ctx,
-          this.tapMasterFilter,
-          this.tapReverbConvolver,
-          buffer,
-          pad.volume_db,
-          pad.reverb,
-          velocity,
-          ctx.currentTime + 0.002
-        );
-      }
-    };
-
-    void playLoaded();
+    if (cached && this.tapMasterFilter) {
+      this.triggerTapPadWithFx(
+        ctx,
+        this.tapMasterFilter,
+        this.tapReverbConvolver,
+        cached,
+        pad.volume_db,
+        pad.reverb,
+        velocity,
+        ctx.currentTime + 0.004
+      );
+    } else if (this.tapMasterFilter) {
+      const immediate =
+        pad.sample.source === 'synth' || pad.sample.url.startsWith('synth://')
+          ? this.getOrCreateFallbackBuffer(
+              ctx,
+              pad.sample.url.replace('synth://', '') || pad.id
+            )
+          : this.getOrCreateFallbackBuffer(ctx, pad.id);
+      this.triggerTapPadWithFx(
+        ctx,
+        this.tapMasterFilter,
+        this.tapReverbConvolver,
+        immediate,
+        pad.volume_db,
+        pad.reverb,
+        velocity,
+        ctx.currentTime + 0.004
+      );
+      void this.loadSampleBuffer(ctx, pad.sample, pad.id);
+    }
 
     return {
       stepIndex: snap.stepIndex,
@@ -782,11 +1389,11 @@ export class StudioAudioEngine {
   }
 
   public async startTapLoopFromFirstTap(tapCtxTime: number): Promise<void> {
-    await this.resume();
-    const ctx = this.ensureContext();
+    const ctx = this.unlockSync();
     if (this.isPlaying) return;
 
-    await this.preloadTapPads(this.tapPads);
+    this.ensureClickBuffersCached(ctx);
+    void this.preloadTapPads(this.tapPads);
 
     const stepCount = getActiveStepCount(this.loopBars);
     const stepDuration = getStepDurationSeconds(this.bpm);
@@ -833,8 +1440,7 @@ export class StudioAudioEngine {
     stepIndex: number;
     wasPlaying: boolean;
   }> {
-    await this.resume();
-    const ctx = this.ensureContext();
+    const ctx = this.unlockSync();
     const dest = this.percussionBus ?? ctx.destination;
     const stepCount = getActiveStepCount(this.loopBars);
     const stepDuration = getStepDurationSeconds(this.bpm);
@@ -857,7 +1463,7 @@ export class StudioAudioEngine {
       volumeDb,
       pan,
       velocity,
-      ctx.currentTime + 0.004
+      ctx.currentTime + 0.006
     );
 
     return {
@@ -866,29 +1472,119 @@ export class StudioAudioEngine {
     };
   }
 
+  public async triggerCustomSampleNoteNow(
+    sample: SampleCandidate,
+    channelId: string,
+    midi: number,
+    velocity = 90,
+    durationSeconds = 0.42,
+    volumeDb = -2,
+    pan = 0
+  ): Promise<{
+    stepIndex: number;
+    wasPlaying: boolean;
+  }> {
+    const ctx = this.unlockSync();
+    const dest = this.percussionBus ?? ctx.destination;
+    const stepCount = getActiveStepCount(this.loopBars);
+    const stepDuration = getStepDurationSeconds(this.bpm);
+    const snap = this.isPlaying
+      ? snapStepFromTiming(
+          ctx.currentTime,
+          this.nextStepTime,
+          this.currentStep,
+          stepDuration,
+          stepCount
+        )
+      : { stepIndex: 0, isAheadOfCurrent: false };
+
+    const cached = this.sampleCache.get(`${sample.url}@${ctx.sampleRate}`);
+    if (cached) {
+      this.schedulePitchedSampleNote(
+        ctx,
+        dest,
+        cached,
+        midi,
+        durationSeconds,
+        volumeDb,
+        pan,
+        velocity,
+        ctx.currentTime + 0.006
+      );
+    } else {
+      this.scheduleKeyboardSynthNote(
+        ctx,
+        dest,
+        'synth_lead',
+        midi,
+        durationSeconds,
+        volumeDb,
+        pan,
+        velocity,
+        ctx.currentTime + 0.006
+      );
+      void this.loadSampleBuffer(ctx, sample, channelId);
+    }
+
+    return {
+      stepIndex: snap.stepIndex,
+      wasPlaying: this.isPlaying,
+    };
+  }
+
   public async start(): Promise<void> {
-    await this.resume();
-    const ctx = this.ensureContext();
+    const ctx = this.unlockSync();
     if (this.isPlaying) return;
 
+    this.ensureClickBuffersCached(ctx);
+
+    // Preload acoustic samples in the background so playback begins on Beat 1 immediately
+    // with synthesized percussion fallback instead of blocking on external CDN requests.
     if (this.engineMode === 'taploop') {
-      await this.preloadTapPads(this.tapPads);
+      void this.preloadTapPads(this.tapPads);
     } else if (this.engineMode === 'stems') {
-      await Promise.all([
+      void Promise.all([
         this.preloadTracks(this.tracks),
         this.preloadTapPads(this.tapPads),
+        ...this.stemChannels
+          .filter((ch) => ch.customVoiceSample)
+          .map((ch) =>
+            this.loadSampleBuffer(ctx, ch.customVoiceSample!, ch.id).then(
+              () => undefined,
+              () => undefined
+            )
+          ),
       ]);
     } else {
-      await this.preloadTracks(this.tracks);
+      void this.preloadTracks(this.tracks);
     }
 
     this.isPlaying = true;
     this.currentStep = 0;
-    this.nextStepTime = ctx.currentTime + 0.03;
+    this.nextStepTime = ctx.currentTime + 0.025;
     this.applyTapSettingsToAudioNodes();
 
     this.startOriginalPlayback(this.nextStepTime);
+    this.startStemPhoneLoopSource(this.nextStepTime);
+    this.scheduler();
     this.timerId = window.setInterval(() => this.scheduler(), LOOKAHEAD_MS);
+
+    if (ctx.state !== 'running') {
+      void ctx
+        .resume()
+        .then(() => {
+          if (this.onAudioStateChangeCallback) {
+            this.onAudioStateChangeCallback(ctx.state);
+          }
+          if (this.isPlaying && ctx.state === 'running') {
+            if (this.nextStepTime < ctx.currentTime - 0.02) {
+              this.nextStepTime = ctx.currentTime + 0.015;
+            }
+            this.scheduler();
+          }
+        })
+        .catch(() => undefined);
+    }
   }
 
   public stop(): void {
@@ -899,7 +1595,16 @@ export class StudioAudioEngine {
     }
     this.skipOnceMap.clear();
     this.stopActiveHumSources();
+    this.stopStemHumPreview();
+    this.stopStemPhoneLoopSource();
     this.stopOriginalSource();
+    if (this.silentKeepaliveEl && !this.silentKeepaliveEl.paused) {
+      try {
+        this.silentKeepaliveEl.pause();
+      } catch {
+        // Ignore
+      }
+    }
     this.currentStep = 0;
     if (this.onStepCallback) {
       this.onStepCallback(-1);
@@ -907,15 +1612,34 @@ export class StudioAudioEngine {
   }
 
   private stopActiveHumSources(): void {
-    for (const src of this.activeHumSources) {
+    for (const entry of this.activeHumSources) {
       try {
-        src.stop();
-        src.disconnect();
+        entry.src.stop();
+        entry.src.disconnect();
       } catch {
         // Already stopped
       }
     }
     this.activeHumSources = [];
+    this.activeHumGains = [];
+  }
+
+  private stopActiveHumSourcesForChannel(channelId: string): void {
+    const remaining: Array<{ channelId: string; src: AudioBufferSourceNode }> = [];
+    for (const entry of this.activeHumSources) {
+      if (entry.channelId === channelId) {
+        try {
+          entry.src.stop();
+          entry.src.disconnect();
+        } catch {
+          // Already stopped
+        }
+      } else {
+        remaining.push(entry);
+      }
+    }
+    this.activeHumSources = remaining;
+    this.activeHumGains = this.activeHumGains.filter((g) => g.channelId !== channelId);
   }
 
   private stopOriginalSource(): void {
@@ -936,20 +1660,39 @@ export class StudioAudioEngine {
 
   private scheduler(): void {
     if (!this.ctx || !this.isPlaying) return;
-    const stepCount = getActiveStepCount(this.loopBars);
+    const percStepCount = getActiveStepCount(this.loopBars);
+    const stemSongStepCount =
+      this.engineMode === 'stems'
+        ? getSongTimelineSteps(this.stemChannels, percStepCount)
+        : percStepCount;
     const stepDuration = getStepDurationSeconds(this.bpm);
 
+    // Clamp drift so steps are never scheduled far in the past after thread stalls or resume latency
+    if (this.nextStepTime < this.ctx.currentTime - 0.04) {
+      this.nextStepTime = this.ctx.currentTime + 0.012;
+    }
+
     while (this.nextStepTime < this.ctx.currentTime + SCHEDULE_AHEAD_SEC) {
-      const stepToSchedule = this.currentStep % stepCount;
       if (this.engineMode === 'taploop') {
+        const stepToSchedule = this.currentStep % percStepCount;
         this.scheduleTapLoopStep(stepToSchedule, this.nextStepTime);
+        this.nextStepTime += stepDuration;
+        this.currentStep = (this.currentStep + 1) % percStepCount;
       } else if (this.engineMode === 'stems') {
+        const stepToSchedule = this.isRecordingHum
+          ? this.currentStep
+          : this.currentStep % stemSongStepCount;
         this.scheduleStemsStep(stepToSchedule, this.nextStepTime, stepDuration);
+        this.nextStepTime += stepDuration;
+        this.currentStep = this.isRecordingHum
+          ? this.currentStep + 1
+          : (this.currentStep + 1) % stemSongStepCount;
       } else {
+        const stepToSchedule = this.currentStep % percStepCount;
         this.scheduleStep(stepToSchedule, this.nextStepTime);
+        this.nextStepTime += stepDuration;
+        this.currentStep = (this.currentStep + 1) % percStepCount;
       }
-      this.nextStepTime += stepDuration;
-      this.currentStep = (this.currentStep + 1) % stepCount;
     }
   }
 
@@ -960,24 +1703,52 @@ export class StudioAudioEngine {
   ): void {
     if (!this.ctx || !this.percussionBus) return;
 
-    // 1. Imported Website Loop Bed (Sequencer Loop or Tap Loop)
-    if (!this.stemLoopMuted) {
-      const loopGainScale = dbToGain(this.stemLoopVolumeDb);
-      if (this.stemLoopSource === 'taploop') {
+    const percStepCount = getActiveStepCount(this.loopBars);
+    const loopBedStep = ((stepIndex % percStepCount) + percStepCount) % percStepCount;
+    const anyStemSoloed = isAnyStemSoloed(this.stemLoopSoloed, this.stemChannels);
+    const loopBedAllowed =
+      isStemLoopAudible(this.stemLoopMuted, this.stemLoopSoloed, this.stemChannels) &&
+      !(this.isRecordingHum && this.muteBackingWhileHum);
+    const recordingDuckDb = this.isRecordingHum ? -12 : 0;
+
+    // 1. Imported Website Loop Bed or Phone Audio Loop Bed (repeats smoothly under longer vocal stems)
+    if (loopBedAllowed) {
+      const effectiveLoopVolDb =
+        this.stemLoopVolumeDb <= -59.5 ? -60 : this.stemLoopVolumeDb + recordingDuckDb;
+      const loopSilenced = effectiveLoopVolDb <= -59.5;
+      if (this.stemLoopSource === 'phone_audio') {
+        // Phone audio buffer or HTMLAudioElement is managed via startStemPhoneLoopSource & syncStemLoopOutputs
+      } else if (this.stemLoopSource === 'taploop') {
+        const anyPadSoloed = this.tapPads.some((p) => Boolean(p.soloed));
         for (const pad of this.tapPads) {
-          if (pad.muted) continue;
-          const vel = pad.steps[stepIndex] ?? 0;
+          if (!isTapPadAudible(pad, anyPadSoloed)) continue;
+          const vel = pad.steps[loopBedStep] ?? 0;
           if (vel <= 0) continue;
-          const buf =
+          const cachedBuf =
             this.customTapBuffers.get(pad.sample.url) ??
             this.sampleCache.get(`${pad.sample.url}@${this.ctx.sampleRate}`);
-          if (buf && this.tapMasterFilter) {
+          const buf =
+            cachedBuf ??
+            this.getOrCreateFallbackBuffer(
+              this.ctx,
+              pad.sample.url.startsWith('synth://')
+                ? pad.sample.url.replace('synth://', '')
+                : pad.id
+            );
+          if (!cachedBuf) {
+            void this.loadSampleBuffer(this.ctx, pad.sample, pad.id);
+          }
+          if (this.tapMasterFilter) {
+            const combinedVolDb =
+              loopSilenced || pad.volume_db <= -59.5
+                ? -60
+                : pad.volume_db + effectiveLoopVolDb;
             this.triggerTapPadWithFx(
               this.ctx,
               this.tapMasterFilter,
               this.tapReverbConvolver,
               buf,
-              pad.volume_db + this.stemLoopVolumeDb,
+              combinedVolDb,
               pad.reverb,
               vel,
               when
@@ -987,85 +1758,158 @@ export class StudioAudioEngine {
       } else {
         const anySoloOrig = this.tracks.some((t) => Boolean(t.soloed));
         for (const track of this.tracks) {
-          if (track.isClick && !this.metronomeEnabled) continue;
+          if (track.isClick && (!this.metronomeEnabled || this.isRecordingHum)) continue;
           if (!isTrackAudible(track, anySoloOrig)) continue;
-          const vel = track.steps[stepIndex] ?? 0;
+          const vel = track.steps[loopBedStep] ?? 0;
           if (vel <= 0) continue;
           const sample = track.samples?.[track.activeSampleIndex ?? 0];
           if (!sample) continue;
-          const buf = this.sampleCache.get(`${sample.url}@${this.ctx.sampleRate}`);
-          if (buf) {
-            const adjustedTrack = {
-              ...track,
-              volume_db: track.isClick
-                ? track.volume_db
-                : track.volume_db + (loopGainScale <= 0.01 ? -60 : this.stemLoopVolumeDb),
-            };
-            this.triggerBufferAt(this.ctx, this.percussionBus, buf, adjustedTrack, vel, when);
+          const cachedBuf = this.sampleCache.get(`${sample.url}@${this.ctx.sampleRate}`);
+          const buf =
+            cachedBuf ??
+            this.getOrCreateFallbackBuffer(
+              this.ctx,
+              sample.url.startsWith('synth://')
+                ? sample.url.replace('synth://', '')
+                : track.instrument_id
+            );
+          if (!cachedBuf) {
+            void this.loadSampleBuffer(this.ctx, sample, track.instrument_id);
           }
+          const adjustedTrack = {
+            ...track,
+            volume_db: track.isClick
+              ? track.volume_db
+              : loopSilenced || track.volume_db <= -59.5
+              ? -60
+              : track.volume_db + effectiveLoopVolDb,
+          };
+          this.triggerBufferAt(this.ctx, this.percussionBus, buf, adjustedTrack, vel, when);
         }
       }
     }
 
-    // Metronome click if switch is on and using Tap Loop bed
-    if (this.metronomeEnabled && this.stemLoopSource === 'taploop' && stepIndex % 4 === 0) {
-      const isBeatOne = stepIndex % 16 === 0;
+    // Metronome click if switch is on and Row 1 isn't solo-excluded and not actively mic-recording
+    if (
+      this.metronomeEnabled &&
+      !this.isRecordingHum &&
+      (!anyStemSoloed || this.stemLoopSoloed) &&
+      (this.stemLoopSource === 'taploop' || this.stemLoopSource === 'phone_audio') &&
+      loopBedStep % 4 === 0
+    ) {
+      const isBeatOne = loopBedStep % 16 === 0;
       const clickKey = isBeatOne ? 'synth://click_hi' : 'synth://click_lo';
-      const clickBuf = this.sampleCache.get(`${clickKey}@${this.ctx.sampleRate}`);
-      if (clickBuf) {
-        this.triggerPadBufferAt(
-          this.ctx,
-          this.percussionBus,
-          clickBuf,
-          isBeatOne ? -2 : -4,
-          isBeatOne ? 98 : 78,
-          when
-        );
-      }
+      const clickBuf =
+        this.sampleCache.get(`${clickKey}@${this.ctx.sampleRate}`) ??
+        this.getOrCreateFallbackBuffer(this.ctx, isBeatOne ? 'click_hi' : 'click_lo');
+      this.triggerPadBufferAt(
+        this.ctx,
+        this.percussionBus,
+        clickBuf,
+        isBeatOne ? -2 : -4,
+        isBeatOne ? 98 : 78,
+        when
+      );
     }
 
-    // 2. Melodic & Hum Stem Channels
-    const anyStemSoloed = this.stemChannels.some((c) => Boolean(c.soloed));
-    for (const ch of this.stemChannels) {
-      if (ch.muted) continue;
-      if (anyStemSoloed && !ch.soloed) continue;
+    // 2. Melodic & Hum Stem Channels (silenced during active hum recording so only your voice is captured!)
+    if (!this.isRecordingHum) {
+      for (const ch of this.stemChannels) {
+        if (!isStemChannelAudible(ch, this.stemLoopSoloed, this.stemChannels)) continue;
+        const chSteps = getChannelTimelineSteps(ch, percStepCount);
+        const chStep = ((stepIndex % chSteps) + chSteps) % chSteps;
 
-      if (ch.voiceMode === 'hum_audio' && ch.hasHumAudio) {
-        if (stepIndex === 0) {
-          const humBuf = this.stemHumBuffers.get(ch.id);
-          if (humBuf) {
-            const src = this.ctx.createBufferSource();
-            src.buffer = humBuf;
-            const gain = this.ctx.createGain();
-            gain.gain.setValueAtTime(dbToGain(ch.volume_db), when);
-            const panner = this.ctx.createStereoPanner();
-            panner.pan.setValueAtTime(Math.max(-1, Math.min(1, ch.pan)), when);
-            src.connect(gain);
-            gain.connect(panner);
-            panner.connect(this.percussionBus);
-            src.start(when);
-            this.activeHumSources.push(src);
-            src.onended = () => {
-              this.activeHumSources = this.activeHumSources.filter((s) => s !== src);
-            };
+        if (ch.voiceMode === 'hum_audio' && ch.hasHumAudio) {
+          if (chStep === 0) {
+            const humBuf = this.stemHumBuffers.get(ch.id);
+            if (humBuf) {
+              this.stopActiveHumSourcesForChannel(ch.id);
+              const src = this.ctx.createBufferSource();
+              src.buffer = humBuf;
+              const gain = this.ctx.createGain();
+              gain.gain.setValueAtTime(dbToGain(ch.volume_db), when);
+              const panner = this.ctx.createStereoPanner();
+              panner.pan.setValueAtTime(Math.max(-1, Math.min(1, ch.pan)), when);
+              src.connect(gain);
+              gain.connect(panner);
+              panner.connect(this.percussionBus);
+              const chDurSec = chSteps * stepDuration;
+              src.start(when);
+              if (humBuf.duration > chDurSec + 0.08) {
+                src.stop(when + chDurSec);
+              }
+              const humEntry = { channelId: ch.id, src };
+              const humGainEntry = { channelId: ch.id, gain };
+              this.activeHumSources.push(humEntry);
+              this.activeHumGains.push(humGainEntry);
+              src.onended = () => {
+                this.activeHumSources = this.activeHumSources.filter((s) => s !== humEntry);
+                this.activeHumGains = this.activeHumGains.filter((g) => g !== humGainEntry);
+              };
+            }
+          }
+          continue;
+        }
+
+        if (ch.voiceMode === 'custom_sample' && ch.customVoiceSample) {
+          const sampleBuf = this.sampleCache.get(
+            `${ch.customVoiceSample.url}@${this.ctx.sampleRate}`
+          );
+          if (sampleBuf) {
+            for (const note of ch.notes) {
+              if (note.step !== chStep) continue;
+              const noteWhen = Math.max(
+                this.ctx.currentTime + 0.002,
+                when + (note.startOffsetSteps ?? 0) * stepDuration
+              );
+              const noteDur = Math.max(
+                0.032,
+                (note.exactDurationSteps ?? note.durationSteps) * stepDuration
+              );
+              this.schedulePitchedSampleNote(
+                this.ctx,
+                this.percussionBus,
+                sampleBuf,
+                note.midi,
+                noteDur,
+                ch.volume_db,
+                ch.pan,
+                note.velocity,
+                noteWhen,
+                note.pitchBendSemitones,
+                note.velocityCurve
+              );
+            }
+            continue;
+          } else {
+            void this.loadSampleBuffer(this.ctx, ch.customVoiceSample, ch.id);
           }
         }
-        continue;
-      }
 
-      for (const note of ch.notes) {
-        if (note.step !== stepIndex) continue;
-        this.scheduleKeyboardSynthNote(
-          this.ctx,
-          this.percussionBus,
-          ch.soundId,
-          note.midi,
-          Math.max(0.08, note.durationSteps * stepDuration),
-          ch.volume_db,
-          ch.pan,
-          note.velocity,
-          when
-        );
+        for (const note of ch.notes) {
+          if (note.step !== chStep) continue;
+          const noteWhen = Math.max(
+            this.ctx.currentTime + 0.002,
+            when + (note.startOffsetSteps ?? 0) * stepDuration
+          );
+          const noteDur = Math.max(
+            0.032,
+            (note.exactDurationSteps ?? note.durationSteps) * stepDuration
+          );
+          this.scheduleKeyboardSynthNote(
+            this.ctx,
+            this.percussionBus,
+            ch.soundId,
+            note.midi,
+            noteDur,
+            ch.volume_db,
+            ch.pan,
+            note.velocity,
+            noteWhen,
+            note.pitchBendSemitones,
+            note.velocityCurve
+          );
+        }
       }
     }
 
@@ -1077,6 +1921,97 @@ export class StudioAudioEngine {
     }, delayMs);
   }
 
+  private schedulePitchBendAutomation(
+    detuneParam: AudioParam,
+    baseCents: number,
+    pitchBendSemitones: number[] | undefined,
+    when: number,
+    durationSec: number
+  ): void {
+    if (!pitchBendSemitones || pitchBendSemitones.length === 0) {
+      detuneParam.setValueAtTime(baseCents, when);
+      return;
+    }
+    const clamped = (s: number) =>
+      baseCents + Math.max(-450, Math.min(450, s * 100));
+    detuneParam.setValueAtTime(clamped(pitchBendSemitones[0]), when);
+    if (pitchBendSemitones.length === 1) return;
+    const span = Math.max(0.02, durationSec);
+    for (let i = 1; i < pitchBendSemitones.length; i++) {
+      const t = when + (i / (pitchBendSemitones.length - 1)) * span;
+      detuneParam.linearRampToValueAtTime(clamped(pitchBendSemitones[i]), t);
+    }
+  }
+
+  private scheduleVelocityExpression(
+    exprParam: AudioParam,
+    velocityCurve: number[] | undefined,
+    when: number,
+    durationSec: number
+  ): void {
+    if (!velocityCurve || velocityCurve.length < 2) {
+      exprParam.setValueAtTime(1.0, when);
+      return;
+    }
+    const safeVal = (v: number) => Math.max(0.18, Math.min(1.15, v));
+    exprParam.setValueAtTime(safeVal(velocityCurve[0]), when);
+    const span = Math.max(0.02, durationSec);
+    for (let i = 1; i < velocityCurve.length; i++) {
+      const t = when + (i / (velocityCurve.length - 1)) * span;
+      exprParam.linearRampToValueAtTime(safeVal(velocityCurve[i]), t);
+    }
+  }
+
+  private schedulePitchedSampleNote(
+    ctx: BaseAudioContext,
+    destination: AudioNode,
+    buffer: AudioBuffer,
+    midi: number,
+    durationSec: number,
+    volumeDb: number,
+    pan: number,
+    velocity: number,
+    when: number,
+    pitchBendSemitones?: number[],
+    velocityCurve?: number[]
+  ): void {
+    const velGain = Math.pow(Math.max(0.1, Math.min(1, velocity / 100)), 0.85);
+    const peakGain = velGain * dbToGain(volumeDb) * 0.72;
+    if (peakGain <= 0.001) return;
+
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.playbackRate.setValueAtTime(Math.pow(2, (midi - 60) / 12), when);
+    this.schedulePitchBendAutomation(
+      src.detune,
+      0,
+      pitchBendSemitones,
+      when,
+      durationSec
+    );
+
+    const env = ctx.createGain();
+    const noteEnd = when + Math.max(0.04, durationSec);
+    const attackSec = Math.min(0.016, durationSec * 0.25);
+    env.gain.setValueAtTime(0.001, when);
+    env.gain.linearRampToValueAtTime(peakGain, when + attackSec);
+    env.gain.setValueAtTime(peakGain * 0.92, Math.max(when + attackSec + 0.005, noteEnd - 0.025));
+    env.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.14);
+
+    const exprGain = ctx.createGain();
+    this.scheduleVelocityExpression(exprGain.gain, velocityCurve, when, durationSec);
+
+    const panner = ctx.createStereoPanner();
+    panner.pan.setValueAtTime(Math.max(-1, Math.min(1, pan)), when);
+
+    src.connect(env);
+    env.connect(exprGain);
+    exprGain.connect(panner);
+    panner.connect(destination);
+    src.start(when);
+    src.stop(Math.min(when + buffer.duration + 0.1, noteEnd + 0.2));
+  }
+
   private scheduleKeyboardSynthNote(
     ctx: BaseAudioContext,
     destination: AudioNode,
@@ -1086,26 +2021,64 @@ export class StudioAudioEngine {
     volumeDb: number,
     pan: number,
     velocity: number,
-    when: number
+    when: number,
+    pitchBendSemitones?: number[],
+    velocityCurve?: number[]
   ): void {
     const freq = midiToFreq(midi);
-    const velGain = Math.max(0.08, Math.min(1, velocity / 100));
-    const peakGain = velGain * dbToGain(volumeDb) * 0.42;
+    const velGain = Math.pow(Math.max(0.1, Math.min(1, velocity / 100)), 0.85);
+    const velBrightness = 0.45 + 0.65 * velGain;
+    const peakGain = velGain * dbToGain(volumeDb) * 0.64;
     if (peakGain <= 0.001) return;
 
     const filter = ctx.createBiquadFilter();
     filter.type = 'lowpass';
 
     const envGain = ctx.createGain();
+    const exprGain = ctx.createGain();
+    this.scheduleVelocityExpression(exprGain.gain, velocityCurve, when, durationSec);
+
     const panner = ctx.createStereoPanner();
     panner.pan.setValueAtTime(Math.max(-1, Math.min(1, pan)), when);
 
     filter.connect(envGain);
-    envGain.connect(panner);
+    envGain.connect(exprGain);
+    exprGain.connect(panner);
     panner.connect(destination);
 
     const oscs: OscillatorNode[] = [];
-    const noteEnd = when + Math.max(0.09, durationSec);
+    const safeDur = Math.max(0.032, durationSec);
+    const noteEnd = when + safeDur;
+    const hasExplicitBend = Boolean(pitchBendSemitones && pitchBendSemitones.length >= 2);
+    const addOscWithBend = (osc: OscillatorNode, baseCents = 0) => {
+      this.schedulePitchBendAutomation(
+        osc.detune,
+        baseCents,
+        pitchBendSemitones,
+        when,
+        safeDur
+      );
+      oscs.push(osc);
+    };
+
+    // Subtle organic vibrato only on long sustained melodic notes when no explicit bend curve exists
+    let vibratoOsc: OscillatorNode | null = null;
+    const attachGentleVibrato = (targets: OscillatorNode[], depthCents = 5) => {
+      if (hasExplicitBend || safeDur < 0.28) return;
+      vibratoOsc = ctx.createOscillator();
+      vibratoOsc.type = 'sine';
+      vibratoOsc.frequency.setValueAtTime(5.1, when);
+      const vGain = ctx.createGain();
+      vGain.gain.setValueAtTime(0, when);
+      vGain.gain.linearRampToValueAtTime(depthCents, Math.min(noteEnd, when + 0.22));
+      vibratoOsc.connect(vGain);
+      for (const t of targets) {
+        vGain.connect(t.detune);
+      }
+      oscs.push(vibratoOsc);
+    };
+
+    const smoothAttack = Math.min(0.018, safeDur * 0.28);
 
     if (soundId === 'worship_bass') {
       const o1 = ctx.createOscillator();
@@ -1119,16 +2092,18 @@ export class StudioAudioEngine {
       o1.connect(filter);
       o2.connect(g2);
       g2.connect(filter);
-      oscs.push(o1, o2);
+      addOscWithBend(o1, 0);
+      addOscWithBend(o2, 0);
 
-      filter.frequency.setValueAtTime(Math.min(1800, freq * 6), when);
-      filter.frequency.exponentialRampToValueAtTime(Math.max(160, freq * 2.1), noteEnd);
+      filter.frequency.setValueAtTime(Math.min(2000, freq * 5.5 * velBrightness), when);
+      filter.frequency.exponentialRampToValueAtTime(Math.max(150, freq * 2.0), noteEnd);
       envGain.gain.setValueAtTime(0.001, when);
-      envGain.gain.linearRampToValueAtTime(peakGain * 1.25, when + 0.01);
+      envGain.gain.linearRampToValueAtTime(peakGain * 1.2, when + Math.min(0.012, smoothAttack));
       envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.08);
     } else if (soundId === 'gospel_organ') {
       const ratios = [1, 2, 3, 4];
-      const weights = [0.55, 0.35, 0.25, 0.16];
+      const weights = [0.55, 0.34, 0.22, 0.14];
+      const organOscs: OscillatorNode[] = [];
       ratios.forEach((r, idx) => {
         const osc = ctx.createOscillator();
         osc.type = idx % 2 === 0 ? 'sine' : 'triangle';
@@ -1137,43 +2112,88 @@ export class StudioAudioEngine {
         g.gain.setValueAtTime(weights[idx], when);
         osc.connect(g);
         g.connect(filter);
-        oscs.push(osc);
+        addOscWithBend(osc, idx === 1 ? 2 : idx === 2 ? -2 : 0);
+        organOscs.push(osc);
       });
-      filter.frequency.setValueAtTime(4200, when);
+      attachGentleVibrato(organOscs, 4);
+      filter.frequency.setValueAtTime(Math.min(5000, 3400 * velBrightness), when);
       envGain.gain.setValueAtTime(0.001, when);
-      envGain.gain.linearRampToValueAtTime(peakGain * 0.9, when + 0.012);
-      envGain.gain.setValueAtTime(peakGain * 0.85, Math.max(when + 0.02, noteEnd - 0.02));
-      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.06);
+      envGain.gain.linearRampToValueAtTime(peakGain * 0.9, when + smoothAttack);
+      envGain.gain.setValueAtTime(
+        peakGain * 0.85,
+        Math.max(when + smoothAttack + 0.004, noteEnd - 0.015)
+      );
+      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.075);
+    } else if (soundId === 'synth_lead') {
+      const leadOscs: OscillatorNode[] = [];
+      [-4.5, 0, 4.5].forEach((cents, idx) => {
+        const osc = ctx.createOscillator();
+        // Warm triangle core + silky detuned saw layers (eliminates harsh buzzy square edge)
+        osc.type = idx === 1 ? 'triangle' : 'sawtooth';
+        osc.frequency.setValueAtTime(freq, when);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(idx === 1 ? 0.56 : 0.28, when);
+        osc.connect(g);
+        g.connect(filter);
+        addOscWithBend(osc, cents);
+        leadOscs.push(osc);
+      });
+      attachGentleVibrato(leadOscs, 6);
+      filter.Q.setValueAtTime(1.5, when);
+      const startCut = Math.min(5200, Math.max(900, freq * 6.5 * velBrightness));
+      const sustainCut = Math.max(520, freq * 2.4 * velBrightness);
+      filter.frequency.setValueAtTime(startCut * 0.72, when);
+      filter.frequency.linearRampToValueAtTime(startCut, when + Math.min(0.035, safeDur * 0.4));
+      filter.frequency.exponentialRampToValueAtTime(sustainCut, noteEnd + 0.08);
+      envGain.gain.setValueAtTime(0.001, when);
+      envGain.gain.linearRampToValueAtTime(peakGain * 0.92, when + smoothAttack);
+      envGain.gain.setValueAtTime(
+        peakGain * 0.84,
+        Math.max(when + smoothAttack + 0.004, noteEnd - 0.02)
+      );
+      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.14);
     } else if (soundId === 'synth_brass') {
-      [-6, 6].forEach((cents) => {
+      const brassOscs: OscillatorNode[] = [];
+      [-5, 5].forEach((cents) => {
         const osc = ctx.createOscillator();
         osc.type = 'sawtooth';
         osc.frequency.setValueAtTime(freq, when);
-        osc.detune.setValueAtTime(cents, when);
         osc.connect(filter);
-        oscs.push(osc);
+        addOscWithBend(osc, cents);
+        brassOscs.push(osc);
       });
-      filter.frequency.setValueAtTime(750, when);
-      filter.frequency.exponentialRampToValueAtTime(3600, when + 0.055);
-      filter.frequency.exponentialRampToValueAtTime(1400, noteEnd + 0.05);
+      attachGentleVibrato(brassOscs, 4);
+      filter.Q.setValueAtTime(1.2, when);
+      filter.frequency.setValueAtTime(650 * velBrightness, when);
+      filter.frequency.exponentialRampToValueAtTime(
+        Math.max(900, 3400 * velBrightness),
+        when + Math.min(0.055, safeDur * 0.45)
+      );
+      filter.frequency.exponentialRampToValueAtTime(Math.max(550, 1300 * velBrightness), noteEnd + 0.05);
       envGain.gain.setValueAtTime(0.001, when);
-      envGain.gain.linearRampToValueAtTime(peakGain * 0.85, when + 0.025);
+      envGain.gain.linearRampToValueAtTime(peakGain * 0.86, when + Math.min(0.025, safeDur * 0.35));
       envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.12);
     } else if (soundId === 'warm_pad' || soundId === 'choir_voice') {
       const isChoir = soundId === 'choir_voice';
-      [-7, 0, 7].forEach((cents, idx) => {
+      const padOscs: OscillatorNode[] = [];
+      [-6, 0, 6].forEach((cents, idx) => {
         const osc = ctx.createOscillator();
         osc.type = isChoir ? (idx === 1 ? 'sawtooth' : 'triangle') : 'triangle';
         osc.frequency.setValueAtTime(freq, when);
-        osc.detune.setValueAtTime(cents, when);
-        osc.connect(filter);
-        oscs.push(osc);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(isChoir && idx === 1 ? 0.32 : 0.45, when);
+        osc.connect(g);
+        g.connect(filter);
+        addOscWithBend(osc, cents);
+        padOscs.push(osc);
       });
-      filter.frequency.setValueAtTime(isChoir ? 1350 : 2100, when);
-      filter.Q.setValueAtTime(isChoir ? 2.2 : 0.9, when);
+      attachGentleVibrato(padOscs, isChoir ? 7 : 4);
+      filter.frequency.setValueAtTime((isChoir ? 1450 : 2100) * velBrightness, when);
+      filter.Q.setValueAtTime(isChoir ? 1.8 : 0.9, when);
+      const padAttack = Math.min(0.055, safeDur * 0.4);
       envGain.gain.setValueAtTime(0.001, when);
-      envGain.gain.linearRampToValueAtTime(peakGain * 0.8, when + 0.07);
-      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.22);
+      envGain.gain.linearRampToValueAtTime(peakGain * 0.84, when + padAttack);
+      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.2);
     } else if (soundId === 'rhodes_ep') {
       const fund = ctx.createOscillator();
       fund.type = 'sine';
@@ -1182,16 +2202,17 @@ export class StudioAudioEngine {
       tine.type = 'sine';
       tine.frequency.setValueAtTime(freq * 4, when);
       const tineGain = ctx.createGain();
-      tineGain.gain.setValueAtTime(0.28, when);
+      tineGain.gain.setValueAtTime(0.24 * velBrightness, when);
       tineGain.gain.exponentialRampToValueAtTime(0.005, when + 0.12);
       fund.connect(filter);
       tine.connect(tineGain);
       tineGain.connect(filter);
-      oscs.push(fund, tine);
-      filter.frequency.setValueAtTime(3200, when);
+      addOscWithBend(fund, 0);
+      addOscWithBend(tine, 0);
+      filter.frequency.setValueAtTime(Math.max(1200, 3200 * velBrightness), when);
       envGain.gain.setValueAtTime(0.001, when);
-      envGain.gain.linearRampToValueAtTime(peakGain, when + 0.006);
-      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.18);
+      envGain.gain.linearRampToValueAtTime(peakGain, when + Math.min(0.008, smoothAttack));
+      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.16);
     } else if (soundId === 'marimba_pluck') {
       const o1 = ctx.createOscillator();
       o1.type = 'sine';
@@ -1200,16 +2221,17 @@ export class StudioAudioEngine {
       o2.type = 'sine';
       o2.frequency.setValueAtTime(freq * 4, when);
       const g2 = ctx.createGain();
-      g2.gain.setValueAtTime(0.32, when);
+      g2.gain.setValueAtTime(0.32 * velBrightness, when);
       g2.gain.exponentialRampToValueAtTime(0.001, when + 0.045);
       o1.connect(filter);
       o2.connect(g2);
       g2.connect(filter);
-      oscs.push(o1, o2);
-      filter.frequency.setValueAtTime(3800, when);
+      addOscWithBend(o1, 0);
+      addOscWithBend(o2, 0);
+      filter.frequency.setValueAtTime(Math.max(1600, 3800 * velBrightness), when);
       envGain.gain.setValueAtTime(0.001, when);
-      envGain.gain.linearRampToValueAtTime(peakGain * 1.15, when + 0.004);
-      envGain.gain.exponentialRampToValueAtTime(0.001, when + Math.min(0.32, durationSec + 0.1));
+      envGain.gain.linearRampToValueAtTime(peakGain * 1.12, when + 0.005);
+      envGain.gain.exponentialRampToValueAtTime(0.001, when + Math.min(0.32, safeDur + 0.1));
     } else {
       // grand_piano default
       const o1 = ctx.createOscillator();
@@ -1219,20 +2241,21 @@ export class StudioAudioEngine {
       o2.type = 'sine';
       o2.frequency.setValueAtTime(freq * 2, when);
       const g2 = ctx.createGain();
-      g2.gain.setValueAtTime(0.32, when);
+      g2.gain.setValueAtTime(0.32 * velBrightness, when);
       g2.gain.exponentialRampToValueAtTime(0.02, noteEnd + 0.12);
       o1.connect(filter);
       o2.connect(g2);
       g2.connect(filter);
-      oscs.push(o1, o2);
-      filter.frequency.setValueAtTime(4800, when);
-      filter.frequency.exponentialRampToValueAtTime(1600, noteEnd + 0.14);
+      addOscWithBend(o1, 0);
+      addOscWithBend(o2, 0);
+      filter.frequency.setValueAtTime(Math.max(1800, 4800 * velBrightness), when);
+      filter.frequency.exponentialRampToValueAtTime(Math.max(900, 1600 * velBrightness), noteEnd + 0.14);
       envGain.gain.setValueAtTime(0.001, when);
-      envGain.gain.linearRampToValueAtTime(peakGain, when + 0.005);
-      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.16);
+      envGain.gain.linearRampToValueAtTime(peakGain, when + Math.min(0.008, smoothAttack));
+      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.15);
     }
 
-    const stopTime = noteEnd + 0.25;
+    const stopTime = noteEnd + 0.24;
     for (const osc of oscs) {
       osc.start(when);
       osc.stop(stopTime);
@@ -1242,8 +2265,9 @@ export class StudioAudioEngine {
   private scheduleTapLoopStep(stepIndex: number, when: number): void {
     if (!this.ctx || !this.tapMasterFilter) return;
 
+    const anyPadSoloed = this.tapPads.some((p) => Boolean(p.soloed));
     for (const pad of this.tapPads) {
-      if (pad.muted) continue;
+      if (!isTapPadAudible(pad, anyPadSoloed)) continue;
       const velocity = pad.steps[stepIndex] ?? 0;
       if (velocity <= 0) continue;
 
@@ -1253,49 +2277,57 @@ export class StudioAudioEngine {
         continue;
       }
 
-      const buffer =
+      const cachedBuffer =
         this.customTapBuffers.get(pad.sample.url) ??
         this.sampleCache.get(`${pad.sample.url}@${this.ctx.sampleRate}`);
 
-      if (buffer) {
-        this.triggerTapPadWithFx(
+      const buffer =
+        cachedBuffer ??
+        this.getOrCreateFallbackBuffer(
           this.ctx,
-          this.tapMasterFilter,
-          this.tapReverbConvolver,
-          buffer,
-          pad.volume_db,
-          pad.reverb,
-          velocity,
-          when
+          pad.sample.url.startsWith('synth://')
+            ? pad.sample.url.replace('synth://', '')
+            : pad.id
         );
-
-        const delayMs = Math.max(0, (when - this.ctx.currentTime) * 1000);
-        const padId = pad.id;
-        window.setTimeout(() => {
-          if (this.isPlaying && this.onTapPadTriggerCallback) {
-            this.onTapPadTriggerCallback(padId);
-          }
-        }, delayMs);
-      } else {
+      if (!cachedBuffer) {
         void this.loadSampleBuffer(this.ctx, pad.sample, pad.id);
       }
+
+      this.triggerTapPadWithFx(
+        this.ctx,
+        this.tapMasterFilter,
+        this.tapReverbConvolver,
+        buffer,
+        pad.volume_db,
+        pad.reverb,
+        velocity,
+        when
+      );
+
+      const delayMs = Math.max(0, (when - this.ctx.currentTime) * 1000);
+      const padId = pad.id;
+      window.setTimeout(() => {
+        if (this.isPlaying && this.onTapPadTriggerCallback) {
+          this.onTapPadTriggerCallback(padId);
+        }
+      }, delayMs);
     }
 
     // Tempo-locked metronome Click Guide when enabled (on beats 0, 4, 8, 12, ...)
     if (this.metronomeEnabled && stepIndex % 4 === 0 && this.percussionBus) {
       const isBeatOne = stepIndex % 16 === 0;
       const clickKey = isBeatOne ? 'synth://click_hi' : 'synth://click_lo';
-      const clickBuf = this.sampleCache.get(`${clickKey}@${this.ctx.sampleRate}`);
-      if (clickBuf) {
-        this.triggerPadBufferAt(
-          this.ctx,
-          this.percussionBus,
-          clickBuf,
-          isBeatOne ? -3 : -5,
-          isBeatOne ? 98 : 78,
-          when
-        );
-      }
+      const clickBuf =
+        this.sampleCache.get(`${clickKey}@${this.ctx.sampleRate}`) ??
+        this.getOrCreateFallbackBuffer(this.ctx, isBeatOne ? 'click_hi' : 'click_lo');
+      this.triggerPadBufferAt(
+        this.ctx,
+        this.percussionBus,
+        clickBuf,
+        isBeatOne ? -3 : -5,
+        isBeatOne ? 98 : 78,
+        when
+      );
     }
 
     const delayMs = Math.max(0, (when - this.ctx.currentTime) * 1000);
@@ -1320,12 +2352,19 @@ export class StudioAudioEngine {
       if (!sample) continue;
 
       const cacheKey = `${sample.url}@${this.ctx.sampleRate}`;
-      const buffer = this.sampleCache.get(cacheKey);
-      if (buffer) {
-        this.triggerBufferAt(this.ctx, this.percussionBus, buffer, track, velocity, when);
-      } else {
+      const cachedBuffer = this.sampleCache.get(cacheKey);
+      const buffer =
+        cachedBuffer ??
+        this.getOrCreateFallbackBuffer(
+          this.ctx,
+          sample.url.startsWith('synth://')
+            ? sample.url.replace('synth://', '')
+            : track.instrument_id
+        );
+      if (!cachedBuffer) {
         void this.loadSampleBuffer(this.ctx, sample, track.instrument_id);
       }
+      this.triggerBufferAt(this.ctx, this.percussionBus, buffer, track, velocity, when);
     }
 
     const delayMs = Math.max(0, (when - this.ctx.currentTime) * 1000);
@@ -1426,11 +2465,17 @@ export class StudioAudioEngine {
     stemChannels?: StemChannel[];
     stemLoopSource?: StemLoopSource;
     stemLoopMuted?: boolean;
+    stemLoopSoloed?: boolean;
+    stemLoopVolumeDb?: number;
     exportOptions?: ExportOptions;
   }): Promise<Blob> {
     const opts = params.exportOptions;
     const sampleRate = opts?.format === 'wav-compact' ? 22050 : 44100;
-    const stepCount = getActiveStepCount(params.loopBars);
+    const percStepCount = getActiveStepCount(params.loopBars);
+    const stepCount =
+      params.exportStems && params.stemChannels
+        ? getSongTimelineSteps(params.stemChannels, percStepCount)
+        : percStepCount;
     const stepDuration = getStepDurationSeconds(params.bpm);
     const cycleDuration = stepCount * stepDuration;
     const cycleFrames = Math.ceil(cycleDuration * sampleRate);
@@ -1484,39 +2529,69 @@ export class StudioAudioEngine {
     convolver.connect(reverbReturn);
     reverbReturn.connect(filter);
 
+    const stemRow1Audible = isStemLoopAudible(
+      Boolean(params.stemLoopMuted),
+      params.stemLoopSoloed,
+      params.stemChannels ?? []
+    );
+    const usePhoneBed =
+      Boolean(params.exportStems) &&
+      stemRow1Audible &&
+      params.stemLoopSource === 'phone_audio' &&
+      this.stemPhoneLoopBuffer !== null;
     const useTapBed =
       Boolean(params.exportTapLoop) ||
       (Boolean(params.exportStems) &&
-        !params.stemLoopMuted &&
+        stemRow1Audible &&
         params.stemLoopSource === 'taploop');
     const useSequencerBed =
       !params.exportTapLoop &&
       (!params.exportStems ||
-        (!params.stemLoopMuted && params.stemLoopSource !== 'taploop'));
+        (stemRow1Audible && params.stemLoopSource === 'sequencer'));
+
+    const stemLoopVolDb = params.stemLoopVolumeDb ?? this.stemLoopVolumeDb;
+    const stemLoopSilenced = Boolean(params.exportStems) && stemLoopVolDb <= -59.5;
+    if (usePhoneBed && this.stemPhoneLoopBuffer) {
+      const phoneSrc = offlineCtx.createBufferSource();
+      phoneSrc.buffer = this.stemPhoneLoopBuffer;
+      phoneSrc.loop = true;
+      const phoneGain = offlineCtx.createGain();
+      phoneGain.gain.setValueAtTime(dbToGain(stemLoopVolDb), 0);
+      phoneSrc.connect(phoneGain);
+      phoneGain.connect(percBus);
+      phoneSrc.start(0);
+    }
 
     if (useTapBed && params.tapPads) {
+      const anyPadSoloed = params.tapPads.some((p) => Boolean(p.soloed));
       const padBuffers = new Map<string, AudioBuffer>();
       for (const pad of params.tapPads) {
-        if (pad.muted) continue;
+        if (!isTapPadAudible(pad, anyPadSoloed)) continue;
         const buf = await this.loadSampleBuffer(offlineCtx, pad.sample, pad.id);
         padBuffers.set(pad.id, buf);
       }
 
       for (let step = 0; step < stepCount; step++) {
         const when = step * stepDuration;
+        const bedStep = step % percStepCount;
         for (const pad of params.tapPads) {
-          if (pad.muted) continue;
-          const velocity = pad.steps[step] ?? 0;
+          if (!isTapPadAudible(pad, anyPadSoloed)) continue;
+          const velocity = pad.steps[bedStep] ?? 0;
           if (velocity <= 0) continue;
           const buf = padBuffers.get(pad.id);
           if (!buf) continue;
           const effectivePadRev = Math.max(pad.reverb, reverbAmount * 0.6);
+          const padExportVolDb = params.exportStems
+            ? stemLoopSilenced || pad.volume_db <= -59.5
+              ? -60
+              : pad.volume_db + stemLoopVolDb
+            : pad.volume_db;
           this.triggerTapPadWithFx(
             offlineCtx,
             filter,
             convolver,
             buf,
-            pad.volume_db,
+            padExportVolDb,
             effectivePadRev,
             velocity,
             when
@@ -1563,22 +2638,32 @@ export class StudioAudioEngine {
 
       for (let step = 0; step < stepCount; step++) {
         const when = step * stepDuration;
+        const bedStep = step % percStepCount;
         for (const track of params.tracks) {
           if (track.isClick && !includeClick) continue;
           if (!isTrackAudible(track, anySoloed)) continue;
-          const velocity = track.steps[step] ?? 0;
+          const velocity = track.steps[bedStep] ?? 0;
           if (velocity <= 0) continue;
           const buf = loadedBuffers.get(track.instrument_id);
           if (!buf) continue;
           if (track.isClick) {
             this.triggerBufferAt(offlineCtx, percBus, buf, track, velocity, when);
           } else {
-            this.triggerBufferAt(offlineCtx, filter, buf, track, velocity, when);
+            const adjustedTrack = params.exportStems
+              ? {
+                  ...track,
+                  volume_db:
+                    stemLoopSilenced || track.volume_db <= -59.5
+                      ? -60
+                      : track.volume_db + stemLoopVolDb,
+                }
+              : track;
+            this.triggerBufferAt(offlineCtx, filter, buf, adjustedTrack, velocity, when);
             if (reverbAmount > 0.01) {
               const send = offlineCtx.createGain();
               send.gain.setValueAtTime(reverbAmount * 0.65, when);
               send.connect(convolver);
-              this.triggerBufferAt(offlineCtx, send, buf, track, velocity, when);
+              this.triggerBufferAt(offlineCtx, send, buf, adjustedTrack, velocity, when);
             }
           }
         }
@@ -1586,38 +2671,88 @@ export class StudioAudioEngine {
     }
 
     if (params.exportStems && params.stemChannels) {
-      const anyStemSoloed = params.stemChannels.some((c) => Boolean(c.soloed));
       for (const ch of params.stemChannels) {
-        if (ch.muted) continue;
-        if (anyStemSoloed && !ch.soloed) continue;
+        if (!isStemChannelAudible(ch, params.stemLoopSoloed, params.stemChannels)) continue;
+        const chSteps = getChannelTimelineSteps(ch, percStepCount);
 
         if (ch.voiceMode === 'hum_audio' && ch.hasHumAudio) {
           const humBuf = this.stemHumBuffers.get(ch.id);
           if (humBuf) {
-            const src = offlineCtx.createBufferSource();
-            src.buffer = humBuf;
-            const g = offlineCtx.createGain();
-            g.gain.setValueAtTime(dbToGain(ch.volume_db), 0);
-            src.connect(g);
-            g.connect(filter);
-            src.start(0);
+            for (let cycleStart = 0; cycleStart < stepCount; cycleStart += chSteps) {
+              const src = offlineCtx.createBufferSource();
+              src.buffer = humBuf;
+              const g = offlineCtx.createGain();
+              g.gain.setValueAtTime(dbToGain(ch.volume_db), cycleStart * stepDuration);
+              src.connect(g);
+              g.connect(filter);
+              src.start(cycleStart * stepDuration);
+            }
           }
           continue;
         }
 
-        for (const note of ch.notes) {
-          if (note.step >= stepCount) continue;
-          this.scheduleKeyboardSynthNote(
+        if (ch.voiceMode === 'custom_sample' && ch.customVoiceSample) {
+          const sampleBuf = await this.loadSampleBuffer(
             offlineCtx,
-            filter,
-            ch.soundId,
-            note.midi,
-            Math.max(0.08, note.durationSteps * stepDuration),
-            ch.volume_db,
-            ch.pan,
-            note.velocity,
-            note.step * stepDuration
+            ch.customVoiceSample,
+            ch.id
           );
+          for (let cycleStart = 0; cycleStart < stepCount; cycleStart += chSteps) {
+            for (const note of ch.notes) {
+              const globalStep = cycleStart + note.step;
+              if (globalStep >= stepCount) continue;
+              const noteWhen = Math.max(
+                0,
+                (globalStep + (note.startOffsetSteps ?? 0)) * stepDuration
+              );
+              const noteDur = Math.max(
+                0.032,
+                (note.exactDurationSteps ?? note.durationSteps) * stepDuration
+              );
+              this.schedulePitchedSampleNote(
+                offlineCtx,
+                filter,
+                sampleBuf,
+                note.midi,
+                noteDur,
+                ch.volume_db,
+                ch.pan,
+                note.velocity,
+                noteWhen,
+                note.pitchBendSemitones,
+                note.velocityCurve
+              );
+            }
+          }
+          continue;
+        }
+
+        for (let cycleStart = 0; cycleStart < stepCount; cycleStart += chSteps) {
+          for (const note of ch.notes) {
+            const globalStep = cycleStart + note.step;
+            if (globalStep >= stepCount) continue;
+            const noteWhen = Math.max(
+              0,
+              (globalStep + (note.startOffsetSteps ?? 0)) * stepDuration
+            );
+            const noteDur = Math.max(
+              0.032,
+              (note.exactDurationSteps ?? note.durationSteps) * stepDuration
+            );
+            this.scheduleKeyboardSynthNote(
+              offlineCtx,
+              filter,
+              ch.soundId,
+              note.midi,
+              noteDur,
+              ch.volume_db,
+              ch.pan,
+              note.velocity,
+              noteWhen,
+              note.pitchBendSemitones,
+              note.velocityCurve
+            );
+          }
         }
       }
     }

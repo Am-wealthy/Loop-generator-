@@ -59,6 +59,12 @@ const ALLOWED_PROXY_HOSTS = new Set([
   'cdn.freesound.org',
   'cdn.jsdelivr.net',
   'raw.githubusercontent.com',
+  'api.jamendo.com',
+  'mp3d.jamendo.com',
+  'mp3l.jamendo.com',
+  'prod-1.storage.jamendo.com',
+  'pixabay.com',
+  'cdn.pixabay.com',
 ]);
 
 function isAllowedSampleUrl(rawUrl: string): URL | null {
@@ -66,7 +72,12 @@ function isAllowedSampleUrl(rawUrl: string): URL | null {
     const parsed = new URL(rawUrl);
     if (parsed.protocol !== 'https:') return null;
     const host = parsed.hostname.toLowerCase();
-    if (ALLOWED_PROXY_HOSTS.has(host) || host.endsWith('.freesound.org')) {
+    if (
+      ALLOWED_PROXY_HOSTS.has(host) ||
+      host.endsWith('.freesound.org') ||
+      host.endsWith('.jamendo.com') ||
+      host.endsWith('.pixabay.com')
+    ) {
       return parsed;
     }
     return null;
@@ -129,10 +140,23 @@ async function createServer() {
   app.use(express.json({ limit: '35mb' }));
 
   app.get('/api/health', (_req, res) => {
+    const secondaryKey = (
+      process.env.SECONDARY_SOUND_API_KEY ||
+      process.env.JAMENDO_CLIENT_ID ||
+      process.env.PIXABAY_API_KEY ||
+      ''
+    ).trim();
+    const secondaryProvider = process.env.JAMENDO_CLIENT_ID?.trim()
+      ? 'jamendo'
+      : process.env.PIXABAY_API_KEY?.trim()
+      ? 'pixabay'
+      : (process.env.SECONDARY_SOUND_API_PROVIDER || 'freesound').trim().toLowerCase();
     res.json({
       ok: true,
       geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
       serverFreesoundConfigured: Boolean(process.env.FREESOUND_API_KEY?.trim()),
+      secondarySoundConfigured: Boolean(secondaryKey),
+      secondarySoundProvider: secondaryProvider,
     });
   });
 
@@ -597,6 +621,246 @@ Return ONLY valid JSON with spoken_summary and actions.`;
     }
   });
 
+  app.get('/api/sound-banks/search', async (req, res) => {
+    try {
+      const query = String(req.query.q ?? '').trim();
+      if (!query) {
+        res.status(400).json({ error: 'Query parameter "q" is required.' });
+        return;
+      }
+
+      const bank = String(req.query.bank ?? 'primary').toLowerCase();
+      const mode = String(req.query.mode ?? 'browse').toLowerCase();
+      const isBrowse = mode === 'browse';
+      const page = Math.max(1, Math.min(20, Number(req.query.page ?? 1) || 1));
+      const pageSize = isBrowse ? 12 : 5;
+      const maxDur = isBrowse ? 30 : 2.5;
+
+      if (bank === 'secondary') {
+        const jamendoId = process.env.JAMENDO_CLIENT_ID?.trim() || '';
+        const pixabayKey = process.env.PIXABAY_API_KEY?.trim() || '';
+        const explicitProvider = (
+          process.env.SECONDARY_SOUND_API_PROVIDER || ''
+        )
+          .trim()
+          .toLowerCase();
+        const secondaryKey = (
+          req.header('x-secondary-sound-key') ||
+          process.env.SECONDARY_SOUND_API_KEY ||
+          jamendoId ||
+          pixabayKey ||
+          ''
+        ).trim();
+
+        const provider =
+          explicitProvider ||
+          (jamendoId ? 'jamendo' : pixabayKey ? 'pixabay' : 'freesound');
+
+        if (!secondaryKey) {
+          res.status(200).json({
+            configured: false,
+            bank: 'secondary',
+            provider,
+            results: [],
+            count: 0,
+            page,
+          });
+          return;
+        }
+
+        if (provider === 'jamendo') {
+          const jUrl = new URL('https://api.jamendo.com/v3.0/tracks/');
+          jUrl.searchParams.set('client_id', secondaryKey);
+          jUrl.searchParams.set('format', 'json');
+          jUrl.searchParams.set('limit', String(pageSize));
+          jUrl.searchParams.set('offset', String((page - 1) * pageSize));
+          jUrl.searchParams.set('search', query);
+          jUrl.searchParams.set('audioformat', 'mp32');
+
+          const upstream = await fetch(jUrl.toString());
+          if (!upstream.ok) {
+            const text = await upstream.text();
+            res.status(upstream.status).json({
+              error: `Secondary Sound API (Jamendo ${upstream.status}): ${text.slice(0, 160)}`,
+            });
+            return;
+          }
+          const data = (await upstream.json()) as {
+            headers?: { results_fullcount?: number };
+            results?: Array<{
+              id: string;
+              name: string;
+              duration?: number;
+              artist_name?: string;
+              audio?: string;
+            }>;
+          };
+          const results = (data.results ?? [])
+            .filter((item) => Boolean(item.audio))
+            .map((item) => ({
+              id: `sec-jam-${item.id}`,
+              name: item.name,
+              url: `/api/sample-proxy?url=${encodeURIComponent(item.audio!)}`,
+              source: 'secondary' as const,
+              duration: typeof item.duration === 'number' ? item.duration : undefined,
+              username: item.artist_name,
+              tags: ['jamendo'],
+            }));
+          res.json({
+            configured: true,
+            bank: 'secondary',
+            provider: 'jamendo',
+            count: data.headers?.results_fullcount ?? results.length,
+            page,
+            results,
+          });
+          return;
+        }
+
+        // Default secondary Freesound-compatible bank
+        const apiUrl = new URL('https://freesound.org/apiv2/search/text/');
+        apiUrl.searchParams.set('query', query);
+        apiUrl.searchParams.set('filter', `duration:[0 TO ${maxDur}]`);
+        apiUrl.searchParams.set('fields', 'id,name,duration,username,tags,previews');
+        apiUrl.searchParams.set('page_size', String(pageSize));
+        apiUrl.searchParams.set('page', String(page));
+
+        const upstream = await fetch(apiUrl.toString(), {
+          headers: { Authorization: `Token ${secondaryKey}` },
+        });
+        if (!upstream.ok) {
+          const text = await upstream.text();
+          res.status(upstream.status).json({
+            error: `Secondary Sound API error (${upstream.status}): ${text.slice(0, 180)}`,
+          });
+          return;
+        }
+        const data = (await upstream.json()) as {
+          count?: number;
+          results?: Array<{
+            id: number;
+            name: string;
+            duration?: number;
+            username?: string;
+            tags?: string[];
+            previews?: Record<string, string>;
+          }>;
+        };
+        const results = (data.results ?? [])
+          .map((item) => {
+            const previewUrl =
+              item.previews?.['preview-hq-mp3'] ||
+              item.previews?.['preview-lq-mp3'] ||
+              item.previews?.['preview-hq-ogg'] ||
+              '';
+            if (!previewUrl) return null;
+            return {
+              id: `sec-fs-${item.id}`,
+              name: item.name,
+              url: `/api/sample-proxy?url=${encodeURIComponent(previewUrl)}`,
+              source: 'secondary' as const,
+              duration: typeof item.duration === 'number' ? item.duration : undefined,
+              username: typeof item.username === 'string' ? item.username : undefined,
+              tags: Array.isArray(item.tags) ? item.tags.slice(0, 4) : undefined,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null)
+          .slice(0, pageSize);
+
+        res.json({
+          configured: true,
+          bank: 'secondary',
+          provider,
+          count: typeof data.count === 'number' ? data.count : results.length,
+          page,
+          results,
+        });
+        return;
+      }
+
+      // Primary bank (Freesound)
+      const primaryKey = (
+        req.header('x-freesound-key') ||
+        process.env.FREESOUND_API_KEY ||
+        ''
+      ).trim();
+
+      if (!primaryKey) {
+        res.status(200).json({
+          configured: false,
+          bank: 'primary',
+          provider: 'freesound',
+          results: [],
+          count: 0,
+          page,
+        });
+        return;
+      }
+
+      const apiUrl = new URL('https://freesound.org/apiv2/search/text/');
+      apiUrl.searchParams.set('query', query);
+      apiUrl.searchParams.set('filter', `duration:[0 TO ${maxDur}]`);
+      apiUrl.searchParams.set('fields', 'id,name,duration,username,tags,previews');
+      apiUrl.searchParams.set('page_size', String(pageSize));
+      apiUrl.searchParams.set('page', String(page));
+
+      const upstream = await fetch(apiUrl.toString(), {
+        headers: { Authorization: `Token ${primaryKey}` },
+      });
+      if (!upstream.ok) {
+        const text = await upstream.text();
+        res.status(upstream.status).json({
+          error: `Freesound API error (${upstream.status}): ${text.slice(0, 180)}`,
+        });
+        return;
+      }
+      const data = (await upstream.json()) as {
+        count?: number;
+        results?: Array<{
+          id: number;
+          name: string;
+          duration?: number;
+          username?: string;
+          tags?: string[];
+          previews?: Record<string, string>;
+        }>;
+      };
+      const results = (data.results ?? [])
+        .map((item) => {
+          const previewUrl =
+            item.previews?.['preview-hq-mp3'] ||
+            item.previews?.['preview-lq-mp3'] ||
+            item.previews?.['preview-hq-ogg'] ||
+            '';
+          if (!previewUrl) return null;
+          return {
+            id: `fs-${item.id}`,
+            name: item.name,
+            url: `/api/sample-proxy?url=${encodeURIComponent(previewUrl)}`,
+            source: 'freesound' as const,
+            duration: typeof item.duration === 'number' ? item.duration : undefined,
+            username: typeof item.username === 'string' ? item.username : undefined,
+            tags: Array.isArray(item.tags) ? item.tags.slice(0, 4) : undefined,
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null)
+        .slice(0, pageSize);
+
+      res.json({
+        configured: true,
+        bank: 'primary',
+        provider: 'freesound',
+        count: typeof data.count === 'number' ? data.count : results.length,
+        page,
+        results,
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Sound bank lookup failed.';
+      res.status(502).json({ error: message });
+    }
+  });
+
   app.get('/api/sample-proxy', async (req, res) => {
     try {
       const rawUrl = String(req.query.url ?? '');
@@ -626,6 +890,12 @@ Return ONLY valid JSON with spoken_summary and actions.`;
       res.status(502).json({ error: 'Failed to proxy acoustic sample.' });
     }
   });
+
+  const basicPitchModelDir = path.resolve(
+    __dirname,
+    'node_modules/@spotify/basic-pitch/model'
+  );
+  app.use('/basic-pitch-model', express.static(basicPitchModelDir));
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');

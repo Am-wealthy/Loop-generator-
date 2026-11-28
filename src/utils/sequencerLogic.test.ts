@@ -7,12 +7,17 @@ import {
   encodeStereoWav,
   estimateExportSizeMb,
   formatBarBeatStep,
+  formatVolumeDb,
   getActiveStepCount,
+  getPlaybackAudioDiagnostic,
   getStepDurationSeconds,
   isTrackAudible,
   matchFallbackCategory,
   MAX_UPLOAD_DURATION_SECONDS,
   normalizeArrangement,
+  shouldStreamAudioFile,
+  buildFallbackWaveformPeaks,
+  toggleExclusiveTrackSolo,
 } from './sequencerLogic';
 import { INITIAL_HIGHLIFE_ARRANGEMENT } from '../data/presets';
 
@@ -23,10 +28,13 @@ test('clampBpm enforces studio range 40-220', () => {
   assert.equal(clampBpm(Number.NaN), 126);
 });
 
-test('dbToGain converts dB to linear gain cleanly', () => {
+test('dbToGain and formatVolumeDb convert and format dB levels cleanly', () => {
   assert.equal(Math.round(dbToGain(0) * 1000) / 1000, 1);
   assert.equal(Math.round(dbToGain(-6) * 1000) / 1000, 0.501);
   assert.equal(dbToGain(-60), 0);
+  assert.equal(formatVolumeDb(-60), 'Off');
+  assert.equal(formatVolumeDb(-6), '-6 dB');
+  assert.equal(formatVolumeDb(3), '+3 dB');
 });
 
 test('timing helpers calculate 16th note duration and bar.beat.step formatting', () => {
@@ -116,3 +124,82 @@ test('encodeRepeatedStereoWavBlob tiles cycle PCM cleanly for multi-minute expor
   assert.equal(hv.getUint32(40, true), Math.round(5.5 * sr) * 4);
   assert.ok(estimateExportSizeMb(60, 44100) > 10);
 });
+
+test('getPlaybackAudioDiagnostic detects suspended/interrupted audio context and empty taploop', () => {
+  const blocked = getPlaybackAudioDiagnostic({
+    isPlaying: true,
+    audioContextState: 'suspended',
+    activePage: 'sequencer',
+    metronomeEnabled: true,
+    hasPlayableOriginal: false,
+    blendRatio: 0,
+    activeTapPadStepCount: 0,
+    stemLoopSource: 'sequencer',
+    stemLoopMuted: false,
+    hasPhoneLoopAudio: false,
+    audibleStemNotesOrHumCount: 3,
+  });
+  assert.equal(blocked?.kind, 'context_blocked');
+
+  const emptyTap = getPlaybackAudioDiagnostic({
+    isPlaying: true,
+    audioContextState: 'running',
+    activePage: 'taploop',
+    metronomeEnabled: false,
+    hasPlayableOriginal: false,
+    blendRatio: 0,
+    activeTapPadStepCount: 0,
+    stemLoopSource: 'sequencer',
+    stemLoopMuted: false,
+    hasPhoneLoopAudio: false,
+    audibleStemNotesOrHumCount: 0,
+  });
+  assert.equal(emptyTap?.kind, 'empty_loop');
+
+  const healthyStems = getPlaybackAudioDiagnostic({
+    isPlaying: true,
+    audioContextState: 'running',
+    activePage: 'stems',
+    metronomeEnabled: true,
+    hasPlayableOriginal: false,
+    blendRatio: 0,
+    activeTapPadStepCount: 0,
+    stemLoopSource: 'sequencer',
+    stemLoopMuted: false,
+    hasPhoneLoopAudio: false,
+    audibleStemNotesOrHumCount: 2,
+  });
+  assert.equal(healthyStems, null);
+});
+
+test('toggleExclusiveTrackSolo plays only clicked track and toggles back cleanly', () => {
+  const tracks = INITIAL_HIGHLIFE_ARRANGEMENT.tracks.slice(0, 3).map((t) => ({
+    ...t,
+    muted: false,
+    soloed: false,
+  }));
+  const soloFirst = toggleExclusiveTrackSolo(tracks, tracks[0].instrument_id);
+  assert.equal(soloFirst[0].soloed, true);
+  assert.equal(soloFirst[1].soloed, false);
+  assert.equal(soloFirst[2].soloed, false);
+
+  // Clicking another track switches solo exclusively to that track
+  const soloSecond = toggleExclusiveTrackSolo(soloFirst, tracks[1].instrument_id);
+  assert.equal(soloSecond[0].soloed, false);
+  assert.equal(soloSecond[1].soloed, true);
+  assert.equal(soloSecond[2].soloed, false);
+
+  // Clicking already sole-soloed track returns to full mix
+  const backToAll = toggleExclusiveTrackSolo(soloSecond, tracks[1].instrument_id);
+  assert.equal(backToAll.some((t) => Boolean(t.soloed)), false);
+});
+
+test('shouldStreamAudioFile streams large or long phone audio instead of OOM PCM decoding', () => {
+  assert.equal(shouldStreamAudioFile(2 * 1024 * 1024, 30), false);
+  assert.equal(shouldStreamAudioFile(8 * 1024 * 1024, 30), true);
+  assert.equal(shouldStreamAudioFile(3 * 1024 * 1024, 150), true);
+  const peaks = buildFallbackWaveformPeaks(48);
+  assert.equal(peaks.length, 48);
+  assert.ok(peaks.every((p) => p > 0 && p <= 1));
+});
+

@@ -8,7 +8,7 @@ export interface SampleCandidate {
   id: string;
   name: string;
   url: string;
-  source: 'freesound' | 'cdn' | 'synth' | 'custom';
+  source: 'freesound' | 'secondary' | 'cdn' | 'synth' | 'custom';
   duration?: number;
   username?: string;
   tags?: string[];
@@ -64,6 +64,7 @@ export interface TapPad {
   customFileName?: string;
   steps: number[]; // 64 integers (0 = off, 1-100 = velocity, locked to master BPM)
   muted: boolean;
+  soloed?: boolean;
   volume_db: number;
   reverb: number; // 0 .. 1 per-percussion reverb send
 }
@@ -121,23 +122,28 @@ export type KeyboardSoundId =
   | 'grand_piano'
   | 'rhodes_ep'
   | 'gospel_organ'
+  | 'synth_lead'
   | 'synth_brass'
   | 'warm_pad'
   | 'worship_bass'
   | 'marimba_pluck'
   | 'choir_voice';
 
-export type StemVoiceMode = 'keyboard' | 'hum_audio';
+export type StemVoiceMode = 'keyboard' | 'hum_audio' | 'custom_sample';
 
-export type StemLoopSource = 'sequencer' | 'taploop';
+export type StemLoopSource = 'sequencer' | 'taploop' | 'phone_audio';
 
 export type ScaleType = 'major' | 'minor' | 'pentatonic';
 
 export interface StemNote {
-  step: number; // 0..63
+  step: number; // 0+ (supports extended multi-bar song timelines)
   midi: number; // 36..84
   durationSteps: number; // 1..16
   velocity: number; // 1..100
+  startOffsetSteps?: number; // -0.5..0.5 sub-step micro-timing offset
+  exactDurationSteps?: number; // Exact duration in steps (preserves fast 30ms notes)
+  pitchBendSemitones?: number[]; // Continuous smoothed pitch-bend curve in semitones
+  velocityCurve?: number[]; // Continuous normalized volume/expression curve [0..1]
 }
 
 export interface StemChannel {
@@ -145,12 +151,13 @@ export interface StemChannel {
   name: string;
   color: 'amber' | 'emerald' | 'sky' | 'rose' | 'violet';
   soundId: KeyboardSoundId;
+  customVoiceSample?: SampleCandidate;
   voiceMode: StemVoiceMode;
   hasHumAudio: boolean;
   muted: boolean;
   soloed: boolean;
   volume_db: number;
   pan: number;
+  totalSteps?: number; // Bar-aligned timeline length (extends past 64 when singing longer phrases)
   notes: StemNote[];
 }
-

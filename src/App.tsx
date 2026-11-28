@@ -1370,7 +1370,7 @@ function AppContent() {
                   ...(typeof totalSteps === 'number' && totalSteps > 0
                     ? { totalSteps: Math.max(16, Math.ceil(totalSteps / 16) * 16) }
                     : {}),
-                  voiceMode: ch.voiceMode === 'custom_sample' ? 'custom_sample' : 'keyboard',
+                  voiceMode: ch.voiceMode === 'custom_sample' ? 'custom_sample' : 'hum_audio',
                 }
               : ch
           ),
@@ -1393,7 +1393,7 @@ function AppContent() {
                 ...(typeof totalSteps === 'number' && totalSteps > 0
                   ? { totalSteps: Math.max(16, Math.ceil(totalSteps / 16) * 16) }
                   : {}),
-                voiceMode: ch.voiceMode === 'custom_sample' ? 'custom_sample' : 'keyboard',
+                voiceMode: ch.voiceMode,
                 notes,
               }
             : ch
@@ -1437,6 +1437,11 @@ function AppContent() {
 
   const handleGetSharedAudioContext = useCallback(
     () => engineRef.current!.getSharedAudioContext(),
+    []
+  );
+
+  const handleGetSpeakerMonitorNode = useCallback(
+    () => engineRef.current?.getSpeakerMonitorNode() ?? null,
     []
   );
 
@@ -2024,6 +2029,7 @@ function AppContent() {
             onUnlockAudioSync={handleUnlockAudioSync}
             onEnsurePlaying={handleEnsurePlaying}
             getSharedAudioContext={handleGetSharedAudioContext}
+            getSpeakerMonitorNode={handleGetSpeakerMonitorNode}
             onAfterMicAcquired={handleAfterMicAcquired}
             onSetHumRecordingState={handleSetHumRecordingState}
             getPlaybackTiming={handleGetPlaybackTiming}

@@ -714,25 +714,30 @@ class HumCaptureWorkletProcessor extends AudioWorkletProcessor {
     this.chunkSize = 2048;
     this.voiceBuf = new Float32Array(this.chunkSize);
     this.pitchBuf = new Float32Array(this.chunkSize);
+    this.refBuf = new Float32Array(this.chunkSize);
     this.offset = 0;
   }
   process(inputs) {
     const voiceIn = inputs[0] && inputs[0][0];
     const pitchIn = (inputs[1] && inputs[1][0]) || voiceIn;
+    const refIn = inputs[2] && inputs[2][0];
     if (!voiceIn || voiceIn.length === 0) return true;
     for (let i = 0; i < voiceIn.length; i++) {
       this.voiceBuf[this.offset] = voiceIn[i];
       this.pitchBuf[this.offset] = pitchIn ? pitchIn[i] : voiceIn[i];
+      this.refBuf[this.offset] = refIn ? refIn[i] : 0;
       this.offset++;
       if (this.offset >= this.chunkSize) {
         const vOut = this.voiceBuf;
         const pOut = this.pitchBuf;
+        const rOut = this.refBuf;
         this.port.postMessage(
-          { voice: vOut, pitch: pOut, endTime: currentTime },
-          [vOut.buffer, pOut.buffer]
+          { voice: vOut, pitch: pOut, ref: rOut, endTime: currentTime },
+          [vOut.buffer, pOut.buffer, rOut.buffer]
         );
         this.voiceBuf = new Float32Array(this.chunkSize);
         this.pitchBuf = new Float32Array(this.chunkSize);
+        this.refBuf = new Float32Array(this.chunkSize);
         this.offset = 0;
       }
     }

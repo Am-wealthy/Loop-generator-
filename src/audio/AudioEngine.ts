@@ -137,6 +137,8 @@ export class StudioAudioEngine {
   private stemPhoneLoopSource: AudioBufferSourceNode | null = null;
   private stemPhoneLoopGain: GainNode | null = null;
   private stemPhoneLoopEl: HTMLAudioElement | null = null;
+  private stemPhoneLoopElSource: MediaElementAudioSourceNode | null = null;
+  private stemPhoneLoopElGain: GainNode | null = null;
   private stemPhoneLoopObjectUrl: string | null = null;
 
   // Hum recording isolation state
@@ -299,6 +301,11 @@ export class StudioAudioEngine {
 
   public getSharedAudioContext(): AudioContext {
     return this.ensureContext();
+  }
+
+  public getSpeakerMonitorNode(): AudioNode | null {
+    this.ensureContext();
+    return this.masterGain;
   }
 
   public async resumeAfterMicStart(): Promise<void> {
@@ -550,8 +557,8 @@ export class StudioAudioEngine {
     if (!audible) return 0;
     if (this.isRecordingHum && this.muteBackingWhileHum) return 0;
     const base = dbToGain(this.stemLoopVolumeDb);
-    // Duck Row 1 loop gently while humming so speaker bleed doesn't drown the vocal mic
-    return this.isRecordingHum ? base * 0.22 : base;
+    // Keep Row 1 loop comfortably audible as a guide while recording; adaptive cancellation removes speaker bleed
+    return this.isRecordingHum ? base * 0.67 : base;
   }
 
   private syncStemLoopOutputs(): void {
@@ -559,15 +566,23 @@ export class StudioAudioEngine {
     if (this.ctx && this.stemPhoneLoopGain) {
       this.stemPhoneLoopGain.gain.setTargetAtTime(targetGain, this.ctx.currentTime, 0.018);
     }
+    if (this.ctx && this.stemPhoneLoopElGain) {
+      this.stemPhoneLoopElGain.gain.setTargetAtTime(targetGain, this.ctx.currentTime, 0.018);
+    }
     if (this.stemPhoneLoopEl) {
       const shouldSilenceEl =
         this.engineMode !== 'stems' ||
         this.stemLoopSource !== 'phone_audio' ||
         targetGain <= 0.001;
-      this.stemPhoneLoopEl.muted = shouldSilenceEl;
-      this.stemPhoneLoopEl.volume = shouldSilenceEl
-        ? 0
-        : Math.max(0, Math.min(1, targetGain));
+      if (this.stemPhoneLoopElSource && this.stemPhoneLoopElGain) {
+        this.stemPhoneLoopEl.muted = shouldSilenceEl;
+        this.stemPhoneLoopEl.volume = 1;
+      } else {
+        this.stemPhoneLoopEl.muted = shouldSilenceEl;
+        this.stemPhoneLoopEl.volume = shouldSilenceEl
+          ? 0
+          : Math.max(0, Math.min(1, targetGain));
+      }
     }
   }
 
@@ -754,6 +769,18 @@ export class StudioAudioEngine {
     if (probe.ok) {
       this.stemPhoneLoopEl = probe.element;
       this.stemPhoneLoopObjectUrl = probe.objectUrl;
+      try {
+        const elSrc = ctx.createMediaElementSource(probe.element);
+        const elGain = ctx.createGain();
+        elGain.gain.setValueAtTime(this.computeEffectiveStemLoopGain(), ctx.currentTime);
+        elSrc.connect(elGain);
+        elGain.connect(this.percussionBus ?? ctx.destination);
+        this.stemPhoneLoopElSource = elSrc;
+        this.stemPhoneLoopElGain = elGain;
+      } catch {
+        this.stemPhoneLoopElSource = null;
+        this.stemPhoneLoopElGain = null;
+      }
       this.syncStemLoopOutputs();
       if (this.isPlaying && this.engineMode === 'stems' && this.stemLoopSource === 'phone_audio') {
         this.startStemPhoneLoopSource(ctx.currentTime + 0.01);
@@ -775,6 +802,22 @@ export class StudioAudioEngine {
   public clearStemPhoneLoop(): void {
     this.stopStemPhoneLoopSource();
     this.stemPhoneLoopBuffer = null;
+    if (this.stemPhoneLoopElSource) {
+      try {
+        this.stemPhoneLoopElSource.disconnect();
+      } catch {
+        // Ignore
+      }
+      this.stemPhoneLoopElSource = null;
+    }
+    if (this.stemPhoneLoopElGain) {
+      try {
+        this.stemPhoneLoopElGain.disconnect();
+      } catch {
+        // Ignore
+      }
+      this.stemPhoneLoopElGain = null;
+    }
     if (this.stemPhoneLoopEl) {
       this.stemPhoneLoopEl.pause();
       this.stemPhoneLoopEl.src = '';
@@ -2106,7 +2149,7 @@ export class StudioAudioEngine {
     const loopBedAllowed =
       isStemLoopAudible(this.stemLoopMuted, this.stemLoopSoloed, this.stemChannels) &&
       !(this.isRecordingHum && this.muteBackingWhileHum);
-    const recordingDuckDb = this.isRecordingHum ? -12 : 0;
+    const recordingDuckDb = this.isRecordingHum ? -3.5 : 0;
 
     // 1. Imported Website Loop Bed or Phone Audio Loop Bed (repeats smoothly under longer vocal stems)
     if (loopBedAllowed) {

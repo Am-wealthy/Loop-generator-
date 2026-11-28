@@ -55,6 +55,11 @@ import {
   type MusicalKey,
 } from '../utils/stemBuilderLogic';
 import {
+  isolateCleanVocalFromLoopBleed,
+  polishCleanHumBuffer,
+  RealTimeLoopBleedCanceller,
+} from '../utils/loopBleedCanceller';
+import {
   preloadBasicPitchWorker,
   transcribeVocalAudioInWorker,
 } from '../utils/basicPitchWorkerClient';
@@ -150,6 +155,7 @@ interface StemBuilderStudioProps {
   onUnlockAudioSync: () => void;
   onEnsurePlaying: () => Promise<void>;
   getSharedAudioContext: () => AudioContext;
+  getSpeakerMonitorNode?: () => AudioNode | null;
   onAfterMicAcquired: () => Promise<void>;
   onSetHumRecordingState: (
     active: boolean,
@@ -318,6 +324,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
   onUnlockAudioSync,
   onEnsurePlaying,
   getSharedAudioContext,
+  getSpeakerMonitorNode,
   onAfterMicAcquired,
   onSetHumRecordingState,
   getPlaybackTiming,
@@ -366,7 +373,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
   const [humStatusText, setHumStatusText] = useState<string | null>(null);
   const [humError, setHumError] = useState<string | null>(null);
   const [liveHumMidi, setLiveHumMidi] = useState<number | null>(null);
-  const [muteBackingDuringHum, setMuteBackingDuringHum] = useState<boolean>(true);
+  const [muteBackingDuringHum, setMuteBackingDuringHum] = useState<boolean>(false);
 
   const phoneFileInputRef = useRef<HTMLInputElement | null>(null);
   const humStreamRef = useRef<MediaStream | null>(null);
@@ -377,10 +384,10 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
     hp: BiquadFilterNode;
     humNotch: BiquadFilterNode;
     lp: BiquadFilterNode;
-    compressor: DynamicsCompressorNode;
-    makeupGain: GainNode;
     limiter: DynamicsCompressorNode;
     pitchLp: BiquadFilterNode;
+    speakerMonitorNode?: AudioNode | null;
+    refTapGain?: GainNode | null;
     workletNode?: AudioWorkletNode;
     merger?: ChannelMergerNode;
     scriptNode?: ScriptProcessorNode;
@@ -488,6 +495,19 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
 
     if (humNodesRef.current) {
       try {
+        if (
+          humNodesRef.current.speakerMonitorNode &&
+          humNodesRef.current.refTapGain
+        ) {
+          try {
+            humNodesRef.current.speakerMonitorNode.disconnect(
+              humNodesRef.current.refTapGain
+            );
+          } catch {
+            // Already disconnected from specific tap target
+          }
+          humNodesRef.current.refTapGain.disconnect();
+        }
         if (humNodesRef.current.workletNode) {
           humNodesRef.current.workletNode.port.onmessage = null;
           humNodesRef.current.workletNode.disconnect();
@@ -500,8 +520,6 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
         humNodesRef.current.hp.disconnect();
         humNodesRef.current.humNotch.disconnect();
         humNodesRef.current.lp.disconnect();
-        humNodesRef.current.compressor.disconnect();
-        humNodesRef.current.makeupGain.disconnect();
         humNodesRef.current.limiter.disconnect();
         humNodesRef.current.pitchLp.disconnect();
         humNodesRef.current.merger?.disconnect();
@@ -555,16 +573,16 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
     }
 
     try {
-      // Isolate vocal recording: silence other melodic rows and soften/mute backing loop
+      // Silence other melodic rows so only Row 1 loop plays alongside your clean vocal recording
       onSetHumRecordingStateRef.current(true, muteBackingDuringHum);
 
-      // Disable noiseSuppression & autoGainControl because WebRTC speech NS treats steady
-      // humming as fan noise and chops/crackles vocal audio, while AGC pumps on drum beats.
+      // Keep echoCancellation / noiseSuppression / autoGainControl disabled so OS/WebRTC
+      // speech DSP never warbles, ducks, or chops natural humming; our DSP isolates loop bleed cleanly.
       let stream: MediaStream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            echoCancellation: { ideal: true },
+            echoCancellation: { ideal: false },
             noiseSuppression: { ideal: false },
             autoGainControl: { ideal: false },
             channelCount: 1,
@@ -580,7 +598,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       humStreamRef.current = stream;
 
       // Start playback and re-resume the shared audio context AFTER mic acquisition so
-      // website playback plays separately in the site without getting mixed into this track
+      // Row 1 loop plays clearly over speakers while staying isolated from this stem track
       await onEnsurePlaying();
       await onAfterMicAcquired();
 
@@ -592,10 +610,10 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       void preloadBasicPitchWorker().catch(() => undefined);
 
       const source = sharedCtx.createMediaStreamSource(stream);
-      // 1. Pre-process microphone audio with vocal noise filter + volume compressor + makeup gain
+      // Clean vocal conditioning (no aggressive -32dB compressor that would pump speaker bleed into silences)
       const hp = sharedCtx.createBiquadFilter();
       hp.type = 'highpass';
-      hp.frequency.value = 85;
+      hp.frequency.value = 75;
       hp.Q.value = 0.707;
 
       const humNotch = sharedCtx.createBiquadFilter();
@@ -603,21 +621,11 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       humNotch.frequency.value = 60;
       humNotch.Q.value = 4.0;
 
-      // Preserve vocal harmonics up to 3.8 kHz for Basic Pitch while filtering high-frequency hiss
+      // Preserve natural vocal sheen up to 6.5 kHz while rejecting hiss
       const lp = sharedCtx.createBiquadFilter();
       lp.type = 'lowpass';
-      lp.frequency.value = 3800;
+      lp.frequency.value = 6500;
       lp.Q.value = 0.707;
-
-      const compressor = sharedCtx.createDynamicsCompressor();
-      compressor.threshold.value = -32;
-      compressor.knee.value = 18;
-      compressor.ratio.value = 4;
-      compressor.attack.value = 0.005;
-      compressor.release.value = 0.18;
-
-      const makeupGain = sharedCtx.createGain();
-      makeupGain.gain.value = 1.8;
 
       const limiter = sharedCtx.createDynamicsCompressor();
       limiter.threshold.value = -1.5;
@@ -635,16 +643,23 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       const silentGain = sharedCtx.createGain();
       silentGain.gain.value = 0;
 
+      // Tap sample-locked speaker output (Row 1 loop only) into dedicated unity gain node
+      const speakerMonitorNode = getSpeakerMonitorNode?.() ?? null;
+      const refTapGain = speakerMonitorNode ? sharedCtx.createGain() : null;
+      if (speakerMonitorNode && refTapGain) {
+        refTapGain.gain.value = 1.0;
+        speakerMonitorNode.connect(refTapGain);
+      }
+
       source.connect(hp);
       hp.connect(humNotch);
       humNotch.connect(lp);
-      lp.connect(compressor);
-      compressor.connect(makeupGain);
-      makeupGain.connect(limiter);
+      lp.connect(limiter);
       limiter.connect(pitchLp);
 
       const targetChannelId = channel.id;
       const tracker = new HumCaptureTracker();
+      const realTimeBleedCanceller = new RealTimeLoopBleedCanceller(sharedCtx.sampleRate);
       const initialTiming = getPlaybackTimingRef.current();
       let loopBedSteps = Math.max(
         16,
@@ -654,7 +669,9 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
         initialTiming.stepDuration > 0 ? initialTiming.stepDuration : 60 / bpm / 4;
 
       const continuousRecorder = new ContinuousVocalRecorder(sharedCtx.sampleRate, 180);
+      const continuousRefRecorder = new ContinuousVocalRecorder(sharedCtx.sampleRate, 180);
       const preRollChunks: Float32Array[] = [];
+      const preRollRefChunks: Float32Array[] = [];
       const MAX_PREROLL_CHUNKS = 6;
       let hasHumStarted = false;
       let voiceConfirmCount = 0;
@@ -677,33 +694,66 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
           return;
         }
 
-        const finalPcm = continuousRecorder.finalize();
-        if (!finalPcm) {
+        const rawMicPcm = continuousRecorder.finalize();
+        if (!rawMicPcm) {
           setHumStatusText(
             `No vocal audio detected on ${channel.name} — hold or sing closer to the mic and try again.`
           );
           return;
         }
 
-        const totalTakeSteps = Math.max(
-          loopBedSteps,
-          Math.ceil((finalPcm.length / sharedCtx.sampleRate / loopStepDuration) / 16) * 16
+        const rawRefOrNull = continuousRefRecorder.finalize();
+        const alignedRefPcm = new Float32Array(rawMicPcm.length);
+        if (rawRefOrNull) {
+          const copyLen = Math.min(rawMicPcm.length, rawRefOrNull.length);
+          alignedRefPcm.set(rawRefOrNull.subarray(0, copyLen));
+        }
+
+        // Remove any acoustic speaker bleed from the Row 1 backing loop, keeping vocal audio clean
+        const bleedResult = isolateCleanVocalFromLoopBleed(
+          rawMicPcm,
+          alignedRefPcm,
+          sharedCtx.sampleRate
+        );
+        const finalCleanPcm = polishCleanHumBuffer(
+          bleedResult.cleanPcm,
+          sharedCtx.sampleRate
         );
 
-        const buffer = sharedCtx.createBuffer(1, finalPcm.length, sharedCtx.sampleRate);
-        buffer.getChannelData(0).set(finalPcm);
+        let cleanMaxAbs = 0;
+        for (let i = 0; i < finalCleanPcm.length; i++) {
+          const a = Math.abs(finalCleanPcm[i]);
+          if (a > cleanMaxAbs) cleanMaxAbs = a;
+        }
+        if (cleanMaxAbs < 0.004) {
+          setHumStatusText(
+            `Only loop audio was heard on ${channel.name} — sing or hum closer to your microphone.`
+          );
+          return;
+        }
+
+        const totalTakeSteps = Math.max(
+          loopBedSteps,
+          Math.ceil((finalCleanPcm.length / sharedCtx.sampleRate / loopStepDuration) / 16) * 16
+        );
+
+        const buffer = sharedCtx.createBuffer(1, finalCleanPcm.length, sharedCtx.sampleRate);
+        buffer.getChannelData(0).set(finalCleanPcm);
         const peakBins = Math.min(128, Math.max(64, totalTakeSteps));
-        const peaks = extractPcmWaveformPeaks(finalPcm, peakBins);
+        const peaks = extractPcmWaveformPeaks(finalCleanPcm, peakBins);
         setHumPeaksByChannel((prev) => ({ ...prev, [targetChannelId]: peaks }));
         onSaveHumBufferRef.current?.(targetChannelId, buffer, totalTakeSteps);
 
         const barCount = Math.ceil(totalTakeSteps / 16);
+        const bleedNote = bleedResult.bleedCancelled
+          ? ` (loop bleed removed -${bleedResult.bleedReductionDb} dB)`
+          : '';
         setHumStatusText(
-          `Saved ${barCount} bars of voice on ${channel.name} — transcribing expressive notes in background...`
+          `Saved clean ${barCount}-bar hum on ${channel.name}${bleedNote} — extracting clean notes...`
         );
 
         let lastPctBucket = -1;
-        void transcribeVocalAudioInWorker(finalPcm, sharedCtx.sampleRate, {
+        void transcribeVocalAudioInWorker(finalCleanPcm, sharedCtx.sampleRate, {
           stepDurationSec: loopStepDuration,
           stepCount: totalTakeSteps,
           allowExtendedTimeline: true,
@@ -712,7 +762,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
             if (bucket > lastPctBucket && bucket >= 25) {
               lastPctBucket = bucket;
               setHumStatusText(
-                `Transcribing ${barCount}-bar hum on ${channel.name} (${bucket}%)...`
+                `Extracting clean notes across ${barCount} bars on ${channel.name} (${bucket}%)...`
               );
             }
           },
@@ -721,17 +771,17 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
             if (bpNotes.length > 0) {
               onReplaceHumNotesRef.current?.(targetChannelId, bpNotes, totalTakeSteps);
               setHumStatusText(
-                `Captured ${bpNotes.length} expressive notes across ${barCount} bars on ${channel.name}.`
+                `Clean ${barCount}-bar voice saved & ${bpNotes.length} vocal notes mapped on ${channel.name}${bleedNote}.`
               );
             } else {
               setHumStatusText(
-                `Clean ${barCount}-bar voice & notes saved on ${channel.name}.`
+                `Clean ${barCount}-bar voice saved on ${channel.name}${bleedNote}.`
               );
             }
           })
           .catch(() => {
             setHumStatusText(
-              `Clean ${barCount}-bar voice & notes saved on ${channel.name}.`
+              `Clean ${barCount}-bar voice saved on ${channel.name}${bleedNote}.`
             );
           });
       };
@@ -739,6 +789,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       const processVoiceChunk = (
         voiceBlock: Float32Array,
         pitchBlock: Float32Array,
+        refBlock: Float32Array | null | undefined,
         blockEndTimeSec: number
       ) => {
         const timing = getPlaybackTimingRef.current();
@@ -759,28 +810,36 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
           )
         );
         const blockDuration = voiceBlock.length / sharedCtx.sampleRate;
-        const pitchInfo = detectPitchInfo(
-          pitchBlock,
-          sharedCtx.sampleRate,
-          0.006,
-          0.54
-        );
+        const bleedCheck = realTimeBleedCanceller.processLiveBlock(voiceBlock, refBlock);
+        const pitchSource = bleedCheck.hasLoopRef ? bleedCheck.cleanBlock : pitchBlock;
+        const pitchInfo = bleedCheck.isPureLoopBleed
+          ? null
+          : detectPitchInfo(pitchSource, sharedCtx.sampleRate, 0.006, 0.56);
 
         // Phase 1: Wait until the user actually starts humming (loop keeps playing forever past 4 bars!)
         if (!hasHumStarted) {
           preRollChunks.push(new Float32Array(voiceBlock));
+          preRollRefChunks.push(
+            refBlock ? new Float32Array(refBlock) : new Float32Array(voiceBlock.length)
+          );
           if (preRollChunks.length > MAX_PREROLL_CHUNKS) {
             preRollChunks.shift();
+            preRollRefChunks.shift();
           }
 
-          if (pitchInfo && pitchInfo.rms >= 0.007) {
+          if (!bleedCheck.isPureLoopBleed && pitchInfo && pitchInfo.rms >= 0.007) {
             voiceConfirmCount += 1;
           } else {
             voiceConfirmCount = 0;
           }
 
-          if (voiceConfirmCount >= 2 || (pitchInfo && pitchInfo.clarity >= 0.78 && pitchInfo.rms >= 0.012)) {
-            const preRollSec = preRollChunks.reduce((acc, c) => acc + c.length, 0) / sharedCtx.sampleRate;
+          if (
+            !bleedCheck.isPureLoopBleed &&
+            (voiceConfirmCount >= 2 ||
+              (pitchInfo && pitchInfo.clarity >= 0.78 && pitchInfo.rms >= 0.012))
+          ) {
+            const preRollSec =
+              preRollChunks.reduce((acc, c) => acc + c.length, 0) / sharedCtx.sampleRate;
             const globalStartStep = computeMonotonicStepAtTime(
               timing,
               blockEndTimeSec - blockDuration,
@@ -797,24 +856,31 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
             hasHumStarted = true;
             setIsHumWaitingForVoice(false);
 
+            const leadFrames = Math.round(anchor.leadSilenceSeconds * sharedCtx.sampleRate);
             continuousRecorder.reset(sharedCtx.sampleRate);
-            continuousRecorder.prependSilenceFrames(
-              Math.round(anchor.leadSilenceSeconds * sharedCtx.sampleRate)
-            );
+            continuousRecorder.prependSilenceFrames(leadFrames);
             continuousRecorder.seedPreRollChunks(preRollChunks);
             preRollChunks.length = 0;
+
+            continuousRefRecorder.reset(sharedCtx.sampleRate);
+            continuousRefRecorder.prependSilenceFrames(leadFrames);
+            continuousRefRecorder.seedPreRollChunks(preRollRefChunks);
+            preRollRefChunks.length = 0;
 
             currentExpandedSteps = Math.max(64, loopBedSteps);
             humTakeStepsRef.current = currentExpandedSteps;
             setHumStatusText(
-              `Recording live hum on ${channel.name} — bars expand automatically as long as you keep humming.`
+              `Recording clean hum on ${channel.name} — Row 1 loop stays out of this track.`
             );
           } else {
             return;
           }
         } else {
-          // Phase 2: Continuously append vocal audio without ever wrapping back over Bar 1
+          // Phase 2: Continuously append raw vocal + loop reference in sample lockstep
           continuousRecorder.writeChunk(voiceBlock);
+          continuousRefRecorder.writeChunk(
+            refBlock ?? new Float32Array(voiceBlock.length)
+          );
         }
 
         const globalMidStep = computeMonotonicStepAtTime(
@@ -856,7 +922,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
           onRecordNoteRef.current(targetChannelId, res.action.note, false);
           const noteBar = Math.floor(res.action.note.step / 16) + 1;
           setHumStatusText(
-            `Capturing ${midiToNoteName(res.action.note.midi)} in Bar ${noteBar} (${channel.name}) — keeps expanding as you hum`
+            `Capturing ${midiToNoteName(res.action.note.midi)} in Bar ${noteBar} (${channel.name}) — loop isolated`
           );
         } else if (res.action?.type === 'extend') {
           onExtendNoteRef.current?.(
@@ -868,8 +934,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
         }
       };
 
-      // Prefer real-time AudioWorklet thread (zero React/UI thread audio cracking);
-      // fall back cleanly to 4096-sample ScriptProcessor only if AudioWorklet is unavailable.
+      // Prefer real-time AudioWorklet thread (3 inputs: clean mic, pitch mic, speaker loop ref)
       let usedWorklet = false;
       if (typeof AudioWorkletNode !== 'undefined' && sharedCtx.audioWorklet) {
         try {
@@ -886,31 +951,40 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
             }
           }
           const workletNode = new AudioWorkletNode(sharedCtx, 'hum-capture-worklet', {
-            numberOfInputs: 2,
+            numberOfInputs: 3,
             numberOfOutputs: 1,
             outputChannelCount: [1],
           });
           limiter.connect(workletNode, 0, 0);
           pitchLp.connect(workletNode, 0, 1);
+          if (refTapGain) {
+            refTapGain.connect(workletNode, 0, 2);
+          }
           workletNode.connect(silentGain);
           silentGain.connect(sharedCtx.destination);
           workletNode.port.onmessage = (e: MessageEvent<{
             voice: Float32Array;
             pitch: Float32Array;
+            ref?: Float32Array;
             endTime: number;
           }>) => {
             if (!e.data?.voice) return;
-            processVoiceChunk(e.data.voice, e.data.pitch ?? e.data.voice, e.data.endTime);
+            processVoiceChunk(
+              e.data.voice,
+              e.data.pitch ?? e.data.voice,
+              e.data.ref,
+              e.data.endTime
+            );
           };
           humNodesRef.current = {
             source,
             hp,
             humNotch,
             lp,
-            compressor,
-            makeupGain,
             limiter,
             pitchLp,
+            speakerMonitorNode,
+            refTapGain,
             workletNode,
             silentGain,
           };
@@ -921,10 +995,13 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       }
 
       if (!usedWorklet) {
-        const merger = sharedCtx.createChannelMerger(2);
-        const scriptNode = sharedCtx.createScriptProcessor(4096, 2, 1);
+        const merger = sharedCtx.createChannelMerger(3);
+        const scriptNode = sharedCtx.createScriptProcessor(4096, 3, 1);
         limiter.connect(merger, 0, 0);
         pitchLp.connect(merger, 0, 1);
+        if (refTapGain) {
+          refTapGain.connect(merger, 0, 2);
+        }
         merger.connect(scriptNode);
         scriptNode.connect(silentGain);
         silentGain.connect(sharedCtx.destination);
@@ -937,18 +1014,23 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
             event.inputBuffer.numberOfChannels > 1
               ? event.inputBuffer.getChannelData(1)
               : voiceBlock;
+          const refFull =
+            event.inputBuffer.numberOfChannels > 2
+              ? event.inputBuffer.getChannelData(2)
+              : undefined;
           const nowTiming = getPlaybackTimingRef.current();
-          // Process in two 2048-sample halves for crisp note timing
           const half = Math.floor(voiceBlock.length / 2);
           const blockDur = voiceBlock.length / sharedCtx.sampleRate;
           processVoiceChunk(
             voiceBlock.subarray(0, half),
             pitchFull.subarray(0, half),
+            refFull ? refFull.subarray(0, half) : undefined,
             nowTiming.ctxCurrentTime - blockDur * 0.5
           );
           processVoiceChunk(
             voiceBlock.subarray(half),
             pitchFull.subarray(half),
+            refFull ? refFull.subarray(half) : undefined,
             nowTiming.ctxCurrentTime
           );
         };
@@ -957,10 +1039,10 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
           hp,
           humNotch,
           lp,
-          compressor,
-          makeupGain,
           limiter,
           pitchLp,
+          speakerMonitorNode,
+          refTapGain,
           merger,
           scriptNode,
           silentGain,
@@ -971,7 +1053,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       setIsHumWaitingForVoice(true);
       setLiveHumExpandedSteps(0);
       setHumStatusText(
-        `Loop playing on Row 1 — start humming into ${channel.name} whenever you're ready (keeps playing past 4 bars until you begin).`
+        `Loop playing on Row 1 — start humming into ${channel.name} cleanly whenever you're ready (loop stays out of this track).`
       );
     } catch (err) {
       stopHumCapture();
@@ -1374,8 +1456,8 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                   }`}
                 >
                   {muteBackingDuringHum
-                    ? 'Loop Muted (Zero Bleed)'
-                    : 'Soft Loop Guide (Headphones)'}
+                    ? 'Loop Muted'
+                    : 'Loop Playing (Bleed Cancelled)'}
                 </button>
               )}
               <button

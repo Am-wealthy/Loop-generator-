@@ -1206,13 +1206,16 @@ function AppContent() {
   };
 
   const handleRecordStemNote = useCallback(
-    (channelId: string, note: StemNote) => {
-      commitStemUpdate((p) => ({
-        ...p,
-        stemChannels: p.stemChannels.map((c) =>
-          c.id === channelId ? { ...c, notes: upsertStemNote(c.notes, note) } : c
-        ),
-      }));
+    (channelId: string, note: StemNote, recordHistory = true) => {
+      commitStemUpdate(
+        (p) => ({
+          ...p,
+          stemChannels: p.stemChannels.map((c) =>
+            c.id === channelId ? { ...c, notes: upsertStemNote(c.notes, note) } : c
+          ),
+        }),
+        recordHistory
+      );
     },
     [commitStemUpdate]
   );
@@ -1328,7 +1331,7 @@ function AppContent() {
   };
 
   const handleSaveHumBuffer = useCallback(
-    (channelId: string, buffer: AudioBuffer) => {
+    (channelId: string, buffer: AudioBuffer, totalSteps?: number) => {
       engineRef.current?.setStemHumAudioBuffer(channelId, buffer);
       commitStemUpdate(
         (p) => ({
@@ -1338,6 +1341,9 @@ function AppContent() {
               ? {
                   ...ch,
                   hasHumAudio: true,
+                  ...(typeof totalSteps === 'number' && totalSteps > 0
+                    ? { totalSteps: Math.max(16, Math.ceil(totalSteps / 16) * 16) }
+                    : {}),
                   voiceMode: ch.voiceMode === 'custom_sample' ? 'custom_sample' : 'keyboard',
                 }
               : ch
@@ -1350,7 +1356,7 @@ function AppContent() {
   );
 
   const handleReplaceHumNotes = useCallback(
-    (channelId: string, notes: StemNote[]) => {
+    (channelId: string, notes: StemNote[], totalSteps?: number) => {
       commitStemUpdate((p) => ({
         ...p,
         stemChannels: p.stemChannels.map((ch) =>
@@ -1358,6 +1364,9 @@ function AppContent() {
             ? {
                 ...ch,
                 hasHumAudio: true,
+                ...(typeof totalSteps === 'number' && totalSteps > 0
+                  ? { totalSteps: Math.max(16, Math.ceil(totalSteps / 16) * 16) }
+                  : {}),
                 voiceMode: ch.voiceMode === 'custom_sample' ? 'custom_sample' : 'keyboard',
                 notes,
               }
@@ -1411,8 +1420,8 @@ function AppContent() {
   );
 
   const handleSetHumRecordingState = useCallback(
-    (active: boolean, muteBacking: boolean) => {
-      engineRef.current?.setHumRecordingState(active, muteBacking);
+    (active: boolean, muteBacking: boolean, minTimelineSteps?: number) => {
+      engineRef.current?.setHumRecordingState(active, muteBacking, minTimelineSteps);
     },
     []
   );

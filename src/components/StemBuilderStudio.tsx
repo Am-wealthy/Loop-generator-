@@ -35,24 +35,26 @@ import type {
 import { formatVolumeDb, getActiveStepCount } from '../utils/sequencerLogic';
 import {
   clampMidi,
-  computeContinuousStepAtTime,
-  computeLoopPhaseSeconds,
+  computeHumTakeAnchor,
+  computeLiveExpandedTimelineSteps,
+  computeMonotonicStepAtTime,
+  ContinuousVocalRecorder,
   detectPitchInfo,
+  getChannelTimelineSteps,
   getSongTimelineSteps,
   HUM_WORKLET_PROCESSOR_CODE,
   HumCaptureTracker,
   isBlackKeyMidi,
   isMidiInScale,
   KEYBOARD_SOUND_PRESETS,
-  LoopPcmRecorder,
   midiToNoteName,
   MUSICAL_KEYS,
   type MusicalKey,
 } from '../utils/stemBuilderLogic';
 import {
-  preloadBasicPitchModel,
-  transcribeVocalAudioWithBasicPitch,
-} from '../utils/basicPitchTranscription';
+  preloadBasicPitchWorker,
+  transcribeVocalAudioInWorker,
+} from '../utils/basicPitchWorkerClient';
 import { PianoKeyboardRow } from './PianoKeyboardRow';
 import { StemVoiceBrowserModal } from './StemVoiceBrowserModal';
 
@@ -128,7 +130,7 @@ interface StemBuilderStudioProps {
     midi: number,
     durationSteps: number
   ) => void;
-  onRecordNote: (channelId: string, note: StemNote) => void;
+  onRecordNote: (channelId: string, note: StemNote, recordHistory?: boolean) => void;
   onExtendNote?: (
     channelId: string,
     step: number,
@@ -145,20 +147,25 @@ interface StemBuilderStudioProps {
   onEnsurePlaying: () => Promise<void>;
   getSharedAudioContext: () => AudioContext;
   onAfterMicAcquired: () => Promise<void>;
-  onSetHumRecordingState: (active: boolean, muteBackingWhileHum: boolean) => void;
+  onSetHumRecordingState: (
+    active: boolean,
+    muteBackingWhileHum: boolean,
+    minTimelineSteps?: number
+  ) => void;
   getPlaybackTiming: () => {
     isPlaying: boolean;
     currentStep: number;
     nextStepTime: number;
     stepDuration: number;
     stepCount: number;
+    loopBedStepCount?: number;
     ctxCurrentTime: number;
     baseLatency?: number;
     outputLatency?: number;
   };
   onSaveHumAudio: (channelId: string, blob: Blob) => Promise<void>;
-  onSaveHumBuffer?: (channelId: string, buffer: AudioBuffer) => void;
-  onReplaceHumNotes?: (channelId: string, notes: StemNote[]) => void;
+  onSaveHumBuffer?: (channelId: string, buffer: AudioBuffer, totalSteps?: number) => void;
+  onReplaceHumNotes?: (channelId: string, notes: StemNote[], totalSteps?: number) => void;
   onClearHumAudio: (channelId: string) => void;
   onPlayHumPreview: (channelId: string) => Promise<boolean>;
   onStopHumPreview: () => void;
@@ -325,6 +332,8 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
 
   // Live Sing / Hum Pitch-to-MIDI Capture state
   const [hummingChannelId, setHummingChannelId] = useState<string | null>(null);
+  const [isHumWaitingForVoice, setIsHumWaitingForVoice] = useState<boolean>(false);
+  const [liveHumExpandedSteps, setLiveHumExpandedSteps] = useState<number>(0);
   const [humStatusText, setHumStatusText] = useState<string | null>(null);
   const [humError, setHumError] = useState<string | null>(null);
   const [liveHumMidi, setLiveHumMidi] = useState<number | null>(null);
@@ -332,6 +341,8 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
 
   const phoneFileInputRef = useRef<HTMLInputElement | null>(null);
   const humStreamRef = useRef<MediaStream | null>(null);
+  const humTakeAnchorStepRef = useRef<number | null>(null);
+  const humTakeStepsRef = useRef<number>(0);
   const humNodesRef = useRef<{
     source: MediaStreamAudioSourceNode;
     hp: BiquadFilterNode;
@@ -370,14 +381,37 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
   ]);
 
   useEffect(() => {
-    void preloadBasicPitchModel().catch(() => undefined);
+    void preloadBasicPitchWorker().catch(() => undefined);
   }, []);
 
   const activeStepsCount = getActiveStepCount(loopBars);
+  const songTimelineSteps = useMemo(
+    () =>
+      Math.max(
+        64,
+        getSongTimelineSteps(stemChannels, activeStepsCount),
+        liveHumExpandedSteps
+      ),
+    [stemChannels, activeStepsCount, liveHumExpandedSteps]
+  );
+  const timelineBars = Math.max(4, Math.ceil(songTimelineSteps / 16));
+
+  const displayStep = useMemo(() => {
+    if (!isPlaying || currentStep < 0) return -1;
+    if (hummingChannelId) {
+      if (isHumWaitingForVoice) {
+        return currentStep % activeStepsCount;
+      }
+      const anchor = humTakeAnchorStepRef.current ?? 0;
+      return Math.max(0, currentStep - anchor);
+    }
+    return currentStep % songTimelineSteps;
+  }, [isPlaying, currentStep, hummingChannelId, isHumWaitingForVoice, activeStepsCount, songTimelineSteps]);
+
   const barOffset =
-    followPlayhead && currentStep >= 0
-      ? Math.floor((currentStep % activeStepsCount) / 16)
-      : Math.min(activeBar, loopBars - 1);
+    followPlayhead && displayStep >= 0
+      ? Math.min(timelineBars - 1, Math.floor(displayStep / 16))
+      : Math.min(activeBar, timelineBars - 1);
   const barStartStep = barOffset * 16;
 
   // Keyboard shortcuts for Undo / Redo (Ctrl+Z / Cmd+Z, Ctrl+Shift+Z / Ctrl+Y)
@@ -417,15 +451,12 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
   }, []);
 
   const stopHumCapture = useCallback(() => {
-    if (humFinalizeRef.current) {
-      const finalize = humFinalizeRef.current;
-      humFinalizeRef.current = null;
-      try {
-        finalize();
-      } catch {
-        // Ignore buffer finalize errors
-      }
-    }
+    const finalize = humFinalizeRef.current;
+    humFinalizeRef.current = null;
+    const minStepsToKeep = humTakeStepsRef.current;
+    humTakeAnchorStepRef.current = null;
+    humTakeStepsRef.current = 0;
+
     if (humNodesRef.current) {
       try {
         if (humNodesRef.current.workletNode) {
@@ -455,9 +486,23 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       humStreamRef.current.getTracks().forEach((t) => t.stop());
       humStreamRef.current = null;
     }
-    onSetHumRecordingStateRef.current(false, false);
+
+    onSetHumRecordingStateRef.current(false, false, minStepsToKeep);
     setHummingChannelId(null);
+    setIsHumWaitingForVoice(false);
     setLiveHumMidi(null);
+    setLiveHumExpandedSteps(0);
+
+    // Defer buffer assembly & background Web Worker dispatch until after UI updates immediately
+    if (finalize) {
+      window.setTimeout(() => {
+        try {
+          finalize();
+        } catch {
+          // Ignore buffer finalize errors
+        }
+      }, 0);
+    }
   }, []);
 
   useEffect(() => {
@@ -515,7 +560,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
         await sharedCtx.resume();
       }
 
-      void preloadBasicPitchModel().catch(() => undefined);
+      void preloadBasicPitchWorker().catch(() => undefined);
 
       const source = sharedCtx.createMediaStreamSource(stream);
       // 1. Pre-process microphone audio with vocal noise filter + volume compressor + makeup gain
@@ -572,64 +617,92 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       const targetChannelId = channel.id;
       const tracker = new HumCaptureTracker();
       const initialTiming = getPlaybackTimingRef.current();
-      let loopStepCount = Math.max(16, initialTiming.stepCount || activeStepsCount);
+      let loopBedSteps = Math.max(
+        16,
+        initialTiming.loopBedStepCount || activeStepsCount
+      );
       let loopStepDuration =
         initialTiming.stepDuration > 0 ? initialTiming.stepDuration : 60 / bpm / 4;
-      const loopRecorder = new LoopPcmRecorder(
-        Math.round(loopStepCount * loopStepDuration * sharedCtx.sampleRate),
-        sharedCtx.sampleRate
-      );
+
+      const continuousRecorder = new ContinuousVocalRecorder(sharedCtx.sampleRate, 180);
+      const preRollChunks: Float32Array[] = [];
+      const MAX_PREROLL_CHUNKS = 6;
+      let hasHumStarted = false;
+      let voiceConfirmCount = 0;
+      let anchorCycleStartGlobalStep = 0;
+      let currentExpandedSteps = Math.max(64, loopBedSteps);
+      humTakeAnchorStepRef.current = null;
+      humTakeStepsRef.current = currentExpandedSteps;
+
       let prevReportedLiveMidi: number | null = null;
       let hasSavedBuffer = false;
 
       humFinalizeRef.current = () => {
         if (hasSavedBuffer) return;
         hasSavedBuffer = true;
-        const finalPcm = loopRecorder.finalize();
+
+        if (!hasHumStarted) {
+          setHumStatusText(
+            `Stopped on ${channel.name} — no hum detected yet. Click Hum to Row when ready to sing.`
+          );
+          return;
+        }
+
+        const finalPcm = continuousRecorder.finalize();
         if (!finalPcm) {
           setHumStatusText(
             `No vocal audio detected on ${channel.name} — hold or sing closer to the mic and try again.`
           );
           return;
         }
+
+        const totalTakeSteps = Math.max(
+          loopBedSteps,
+          Math.ceil((finalPcm.length / sharedCtx.sampleRate / loopStepDuration) / 16) * 16
+        );
+
         const buffer = sharedCtx.createBuffer(1, finalPcm.length, sharedCtx.sampleRate);
         buffer.getChannelData(0).set(finalPcm);
-        const peaks = extractPcmWaveformPeaks(finalPcm, 64);
+        const peakBins = Math.min(128, Math.max(64, totalTakeSteps));
+        const peaks = extractPcmWaveformPeaks(finalPcm, peakBins);
         setHumPeaksByChannel((prev) => ({ ...prev, [targetChannelId]: peaks }));
-        onSaveHumBufferRef.current?.(targetChannelId, buffer);
+        onSaveHumBufferRef.current?.(targetChannelId, buffer, totalTakeSteps);
+
+        const barCount = Math.ceil(totalTakeSteps / 16);
         setHumStatusText(
-          `Analyzing quiet details, fast notes & pitch bends on ${channel.name} with Basic Pitch...`
+          `Saved ${barCount} bars of voice on ${channel.name} — transcribing expressive notes in background...`
         );
 
         let lastPctBucket = -1;
-        void transcribeVocalAudioWithBasicPitch(finalPcm, sharedCtx.sampleRate, {
+        void transcribeVocalAudioInWorker(finalPcm, sharedCtx.sampleRate, {
           stepDurationSec: loopStepDuration,
-          stepCount: loopStepCount,
+          stepCount: totalTakeSteps,
+          allowExtendedTimeline: true,
           onProgress: (pct) => {
-            const bucket = Math.min(95, Math.floor((pct * 100) / 20) * 20);
-            if (bucket > lastPctBucket && bucket >= 20) {
+            const bucket = Math.min(95, Math.floor((pct * 100) / 25) * 25);
+            if (bucket > lastPctBucket && bucket >= 25) {
               lastPctBucket = bucket;
               setHumStatusText(
-                `Analyzing quiet details, fast notes & pitch bends on ${channel.name} (${bucket}%)...`
+                `Transcribing ${barCount}-bar hum on ${channel.name} (${bucket}%)...`
               );
             }
           },
         })
           .then((bpNotes) => {
             if (bpNotes.length > 0) {
-              onReplaceHumNotesRef.current?.(targetChannelId, bpNotes);
+              onReplaceHumNotesRef.current?.(targetChannelId, bpNotes, totalTakeSteps);
               setHumStatusText(
-                `Captured ${bpNotes.length} expressive notes with pitch bends on ${channel.name} — loop stays separate on Row 1.`
+                `Captured ${bpNotes.length} expressive notes across ${barCount} bars on ${channel.name}.`
               );
             } else {
               setHumStatusText(
-                `Clean voice & notes saved on ${channel.name} — loop stays separate on Row 1.`
+                `Clean ${barCount}-bar voice & notes saved on ${channel.name}.`
               );
             }
           })
           .catch(() => {
             setHumStatusText(
-              `Clean voice & notes saved on ${channel.name} — loop stays separate on Row 1.`
+              `Clean ${barCount}-bar voice & notes saved on ${channel.name}.`
             );
           });
       };
@@ -642,16 +715,11 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
         const timing = getPlaybackTimingRef.current();
         if (!timing.isPlaying) return;
 
-        if (
-          timing.stepCount !== loopStepCount ||
-          Math.abs(timing.stepDuration - loopStepDuration) > 0.001
-        ) {
-          loopStepCount = Math.max(16, timing.stepCount);
-          loopStepDuration = timing.stepDuration > 0 ? timing.stepDuration : loopStepDuration;
-          loopRecorder.reset(
-            Math.round(loopStepCount * loopStepDuration * sharedCtx.sampleRate),
-            sharedCtx.sampleRate
-          );
+        if (timing.loopBedStepCount && timing.loopBedStepCount !== loopBedSteps) {
+          loopBedSteps = Math.max(16, timing.loopBedStepCount);
+        }
+        if (timing.stepDuration > 0 && Math.abs(timing.stepDuration - loopStepDuration) > 0.001) {
+          loopStepDuration = timing.stepDuration;
         }
 
         const latencyCompSec = Math.min(
@@ -662,30 +730,93 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
           )
         );
         const blockDuration = voiceBlock.length / sharedCtx.sampleRate;
-        const phaseSec = computeLoopPhaseSeconds(
-          timing,
-          blockEndTimeSec - blockDuration,
-          latencyCompSec
-        );
-        loopRecorder.writeChunk(voiceBlock, phaseSec);
-
         const pitchInfo = detectPitchInfo(
           pitchBlock,
           sharedCtx.sampleRate,
           0.006,
           0.54
         );
-        const continuousStep = computeContinuousStepAtTime(
+
+        // Phase 1: Wait until the user actually starts humming (loop keeps playing forever past 4 bars!)
+        if (!hasHumStarted) {
+          preRollChunks.push(new Float32Array(voiceBlock));
+          if (preRollChunks.length > MAX_PREROLL_CHUNKS) {
+            preRollChunks.shift();
+          }
+
+          if (pitchInfo && pitchInfo.rms >= 0.007) {
+            voiceConfirmCount += 1;
+          } else {
+            voiceConfirmCount = 0;
+          }
+
+          if (voiceConfirmCount >= 2 || (pitchInfo && pitchInfo.clarity >= 0.78 && pitchInfo.rms >= 0.012)) {
+            const preRollSec = preRollChunks.reduce((acc, c) => acc + c.length, 0) / sharedCtx.sampleRate;
+            const globalStartStep = computeMonotonicStepAtTime(
+              timing,
+              blockEndTimeSec - blockDuration,
+              latencyCompSec
+            );
+            const anchor = computeHumTakeAnchor(
+              globalStartStep,
+              loopBedSteps,
+              loopStepDuration,
+              preRollSec
+            );
+            anchorCycleStartGlobalStep = anchor.anchorCycleStartGlobalStep;
+            humTakeAnchorStepRef.current = anchorCycleStartGlobalStep;
+            hasHumStarted = true;
+            setIsHumWaitingForVoice(false);
+
+            continuousRecorder.reset(sharedCtx.sampleRate);
+            continuousRecorder.prependSilenceFrames(
+              Math.round(anchor.leadSilenceSeconds * sharedCtx.sampleRate)
+            );
+            continuousRecorder.seedPreRollChunks(preRollChunks);
+            preRollChunks.length = 0;
+
+            currentExpandedSteps = Math.max(64, loopBedSteps);
+            humTakeStepsRef.current = currentExpandedSteps;
+            setHumStatusText(
+              `Recording live hum on ${channel.name} — bars expand automatically as long as you keep humming.`
+            );
+          } else {
+            return;
+          }
+        } else {
+          // Phase 2: Continuously append vocal audio without ever wrapping back over Bar 1
+          continuousRecorder.writeChunk(voiceBlock);
+        }
+
+        const globalMidStep = computeMonotonicStepAtTime(
           timing,
           blockEndTimeSec - blockDuration * 0.5,
           latencyCompSec
         );
+        const linearStep = Math.max(0, globalMidStep - anchorCycleStartGlobalStep);
+
+        const nextExpanded = computeLiveExpandedTimelineSteps(
+          currentExpandedSteps,
+          linearStep,
+          loopBedSteps
+        );
+        if (nextExpanded > currentExpandedSteps) {
+          currentExpandedSteps = nextExpanded;
+          humTakeStepsRef.current = nextExpanded;
+          setLiveHumExpandedSteps(nextExpanded);
+          const barNum = Math.ceil(nextExpanded / 16);
+          setHumStatusText(
+            `Recording live hum on ${channel.name} — expanded to ${barNum} bars...`
+          );
+        }
+
         const res = tracker.processFrame({
           hz: pitchInfo?.hz ?? null,
           rms: pitchInfo?.rms ?? 0,
           clarity: pitchInfo?.clarity ?? 0,
-          continuousStep,
-          stepCount: loopStepCount,
+          continuousStep: linearStep,
+          stepCount: currentExpandedSteps,
+          allowExtendedTimeline: true,
         });
 
         if (res.liveMidi !== prevReportedLiveMidi) {
@@ -693,9 +824,10 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
           setLiveHumMidi(res.liveMidi);
         }
         if (res.action?.type === 'start') {
-          onRecordNoteRef.current(targetChannelId, res.action.note);
+          onRecordNoteRef.current(targetChannelId, res.action.note, false);
+          const noteBar = Math.floor(res.action.note.step / 16) + 1;
           setHumStatusText(
-            `Captured ${midiToNoteName(res.action.note.midi)} at step ${res.action.note.step + 1} (${channel.name})`
+            `Capturing ${midiToNoteName(res.action.note.midi)} in Bar ${noteBar} (${channel.name}) — keeps expanding as you hum`
           );
         } else if (res.action?.type === 'extend') {
           onExtendNoteRef.current?.(
@@ -807,10 +939,10 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       }
 
       setHummingChannelId(targetChannelId);
+      setIsHumWaitingForVoice(true);
+      setLiveHumExpandedSteps(0);
       setHumStatusText(
-        muteBackingDuringHum
-          ? `Recording ONLY your voice on ${channel.name} — Row 1 loop muted so no beat bleeds in (follow the playhead, or switch on Beat Guide with headphones).`
-          : `Recording ONLY your voice on ${channel.name} with soft Beat Guide — use headphones so the loop never enters the mic.`
+        `Loop playing on Row 1 — start humming into ${channel.name} whenever you're ready (keeps playing past 4 bars until you begin).`
       );
     } catch (err) {
       stopHumCapture();
@@ -912,11 +1044,11 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
   }, [rollTopMidi]);
 
   const activePlayingMidis = useMemo(() => {
-    if (!selectedChannel || currentStep < 0) return [];
+    if (!selectedChannel || displayStep < 0) return [];
     return selectedChannel.notes
-      .filter((n) => n.step === currentStep)
+      .filter((n) => n.step === displayStep)
       .map((n) => n.midi);
-  }, [selectedChannel, currentStep]);
+  }, [selectedChannel, displayStep]);
 
   const activeSoundPreset =
     KEYBOARD_SOUND_PRESETS.find((p) => p.id === selectedChannel?.soundId) ??
@@ -933,14 +1065,9 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
   const voiceBrowserTarget =
     stemChannels.find((c) => c.id === voiceBrowserChannelId) ?? null;
 
-  const songTimelineSteps = useMemo(
-    () => Math.max(64, getSongTimelineSteps(stemChannels, activeStepsCount)),
-    [stemChannels, activeStepsCount]
-  );
-  const timelineBars = Math.max(4, Math.ceil(songTimelineSteps / 16));
   const playheadPercent =
-    isPlaying && currentStep >= 0
-      ? ((currentStep % songTimelineSteps) / songTimelineSteps) * 100
+    isPlaying && displayStep >= 0
+      ? Math.min(99.8, (displayStep / songTimelineSteps) * 100)
       : 0;
 
   const effectiveInspectorMode =
@@ -1298,7 +1425,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
 
             {/* Right Area: Aligned Track Headers + Multi-Bar Arrangement Grid */}
             <div className="min-w-0 overflow-x-auto [--track-header-w:156px] sm:[--track-header-w:220px]">
-              <div className="min-w-[640px]">
+              <div style={{ minWidth: `${Math.max(640, timelineBars * 115)}px` }}>
                 {/* Timeline Bar Ruler */}
                 <div className="flex h-8 border-b border-[#2F3A47] bg-[#171D24]">
                   <div className="sticky left-0 z-20 flex w-[156px] shrink-0 items-center justify-between border-r border-[#2F3A47] bg-[#171D24] px-2.5 text-[10px] font-bold tracking-wider text-zinc-400 uppercase sm:w-[220px]">
@@ -1320,11 +1447,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                         <button
                           key={barIdx}
                           type="button"
-                          onClick={() => {
-                            if (barIdx < loopBars) {
-                              onSelectBar(barIdx);
-                            }
-                          }}
+                          onClick={() => onSelectBar(barIdx)}
                           className={`relative flex items-center justify-between border-r border-[#333F4D] px-2 text-left font-mono-tabular text-[11px] font-bold transition-colors ${
                             isCurrentRollBar
                               ? 'bg-[#25303C] text-amber-300'
@@ -1343,7 +1466,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                     })}
 
                     {/* Playhead Triangle on Ruler */}
-                    {isPlaying && currentStep >= 0 && (
+                    {isPlaying && displayStep >= 0 && (
                       <div
                         style={{ left: `${playheadPercent}%` }}
                         className="pointer-events-none absolute top-0 bottom-0 z-20 -translate-x-1/2"
@@ -1356,7 +1479,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
 
                 {/* Track Lanes Body (with unified full-height Playhead cursor) */}
                 <div className="relative">
-                  {isPlaying && currentStep >= 0 && (
+                  {isPlaying && displayStep >= 0 && (
                     <div
                       style={{
                         left: `calc(var(--track-header-w) + (100% - var(--track-header-w)) * ${playheadPercent / 100})`,
@@ -1401,6 +1524,8 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                             ? phoneLoopFileName
                               ? `${Math.round(phoneLoopDurationSec)}s phone WAV`
                               : 'Upload phone loop'
+                            : timelineBars > loopBars
+                            ? `${activeLoopElementsCount} layers · Repeats ${timelineBars}B`
                             : `${activeLoopElementsCount} layers · ${loopBars}B`}
                         </div>
                       </button>
@@ -1468,62 +1593,72 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                         ))}
                       </div>
 
-                      {/* FL Clip Block */}
-                      <div
-                        style={{
-                          left: '0%',
-                          width: `${(loopBars / timelineBars) * 100}%`,
-                        }}
-                        className={`absolute inset-y-1 flex flex-col overflow-hidden rounded-sm border ${
-                          stemLoopMuted
-                            ? 'border-zinc-600/70 opacity-50'
-                            : effectiveInspectorMode === 'loop'
-                            ? 'border-sky-300/80 shadow-sm'
-                            : 'border-[#487CA8]/80'
-                        }`}
-                      >
-                        {/* Colored Clip Top Bar */}
-                        <div className="flex h-4 shrink-0 items-center justify-between bg-[#3E6E94] px-2 text-[10px] font-bold text-white">
-                          <span className="truncate">
-                            {stemLoopSource === 'phone_audio'
-                              ? phoneLoopFileName || 'Phone Audio Clip'
-                              : stemLoopSource === 'taploop'
-                              ? 'Tap Loop Pattern'
-                              : 'Sequencer Pattern'}
-                          </span>
-                          <span className="font-mono-tabular text-[9px] opacity-85">
-                            {loopBars} Bars
-                          </span>
-                        </div>
+                      {/* FL Clip Block(s) — repeat seamlessly when stems expand past 4 bars */}
+                      {Array.from({ length: Math.ceil(timelineBars / loopBars) }).map((_, cycleIdx) => {
+                        const startBar = cycleIdx * loopBars;
+                        const spanBars = Math.min(loopBars, timelineBars - startBar);
+                        const cycleSteps = spanBars * 16;
+                        const peakCount = Math.max(8, Math.round((spanBars / loopBars) * 64));
+                        return (
+                          <div
+                            key={cycleIdx}
+                            style={{
+                              left: `${(startBar / timelineBars) * 100}%`,
+                              width: `${(spanBars / timelineBars) * 100}%`,
+                            }}
+                            className={`absolute inset-y-1 flex flex-col overflow-hidden rounded-sm border ${
+                              stemLoopMuted
+                                ? 'border-zinc-600/70 opacity-50'
+                                : effectiveInspectorMode === 'loop'
+                                ? 'border-sky-300/80 shadow-sm'
+                                : 'border-[#487CA8]/80'
+                            }`}
+                          >
+                            {/* Colored Clip Top Bar */}
+                            <div className="flex h-4 shrink-0 items-center justify-between bg-[#3E6E94] px-2 text-[10px] font-bold text-white">
+                              <span className="truncate">
+                                {stemLoopSource === 'phone_audio'
+                                  ? phoneLoopFileName || 'Phone Audio Clip'
+                                  : stemLoopSource === 'taploop'
+                                  ? 'Tap Loop Pattern'
+                                  : 'Sequencer Pattern'}
+                                {cycleIdx > 0 ? ' (Loop)' : ''}
+                              </span>
+                              <span className="font-mono-tabular text-[9px] opacity-85">
+                                {spanBars} Bars
+                              </span>
+                            </div>
 
-                        {/* Clip Body: Real Waveform OR Percussion Rhythm Bars */}
-                        <div className="flex flex-1 items-center gap-px bg-[#151C24]/90 px-1">
-                          {stemLoopSource === 'phone_audio' && phoneLoopPeaks.length > 0
-                            ? phoneLoopPeaks.slice(0, 64).map((pk, idx) => (
-                                <div
-                                  key={idx}
-                                  style={{
-                                    height: `${Math.max(18, Math.round(pk * 92))}%`,
-                                  }}
-                                  className="flex-1 rounded-xs bg-zinc-100/90"
-                                />
-                              ))
-                            : loopBedStepCounts.slice(0, loopBars * 16).map((cnt, sIdx) => (
-                                <div
-                                  key={sIdx}
-                                  style={{
-                                    height:
-                                      cnt > 0
-                                        ? `${Math.min(92, 26 + cnt * 18)}%`
-                                        : '10%',
-                                  }}
-                                  className={`flex-1 rounded-xs ${
-                                    cnt > 0 ? 'bg-amber-300/90' : 'bg-zinc-700/35'
-                                  }`}
-                                />
-                              ))}
-                        </div>
-                      </div>
+                            {/* Clip Body: Real Waveform OR Percussion Rhythm Bars */}
+                            <div className="flex flex-1 items-center gap-px bg-[#151C24]/90 px-1">
+                              {stemLoopSource === 'phone_audio' && phoneLoopPeaks.length > 0
+                                ? phoneLoopPeaks.slice(0, peakCount).map((pk, idx) => (
+                                    <div
+                                      key={idx}
+                                      style={{
+                                        height: `${Math.max(18, Math.round(pk * 92))}%`,
+                                      }}
+                                      className="flex-1 rounded-xs bg-zinc-100/90"
+                                    />
+                                  ))
+                                : loopBedStepCounts.slice(0, cycleSteps).map((cnt, sIdx) => (
+                                    <div
+                                      key={sIdx}
+                                      style={{
+                                        height:
+                                          cnt > 0
+                                            ? `${Math.min(92, 26 + cnt * 18)}%`
+                                            : '10%',
+                                      }}
+                                      className={`flex-1 rounded-xs ${
+                                        cnt > 0 ? 'bg-amber-300/90' : 'bg-zinc-700/35'
+                                      }`}
+                                    />
+                                  ))}
+                            </div>
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
 
@@ -1546,9 +1681,9 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                         : KEYBOARD_SOUND_PRESETS.find((p) => p.id === ch.soundId)
                             ?.shortLabel ?? 'Synth';
 
-                    const channelMaxStep = ch.notes.reduce(
-                      (max, n) => Math.max(max, n.step + n.durationSteps),
-                      loopBars * 16
+                    const channelMaxStep = Math.max(
+                      getChannelTimelineSteps(ch, loopBars * 16),
+                      isRowHumming ? liveHumExpandedSteps : 0
                     );
                     const clipBarsSpan = Math.min(
                       timelineBars,
@@ -1610,8 +1745,8 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                               }}
                               aria-label={
                                 isRowHumming
-                                  ? `Stop hum recording on ${ch.name}`
-                                  : `Hum to ${ch.name}`
+                                  ? `Stop quick hum on ${ch.name}`
+                                  : `Quick hum on ${ch.name}`
                               }
                               title={isRowHumming ? 'Stop Hum' : 'Hum to Row'}
                               className={`flex h-6 w-6 items-center justify-center rounded transition-colors ${
@@ -1686,7 +1821,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                                   setInspectorTarget('channel');
                                   onSelectChannel(ch.id);
                                   handleFitRollToChannel(ch);
-                                  if (b < loopBars) onSelectBar(b);
+                                  onSelectBar(b);
                                 }}
                                 className={`pointer-events-auto grid cursor-pointer grid-cols-4 border-r border-[#333F4D] ${
                                   b % 2 === 1 ? 'bg-black/10' : ''
@@ -1705,7 +1840,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                             onClick={(e) => {
                               const rect = e.currentTarget.getBoundingClientRect();
                               const rel = Math.max(0, Math.min(0.99, (e.clientX - rect.left) / rect.width));
-                              const clickedBar = Math.min(loopBars - 1, Math.floor(rel * clipBarsSpan));
+                              const clickedBar = Math.min(timelineBars - 1, Math.floor(rel * clipBarsSpan));
                               setInspectorTarget('channel');
                               onSelectChannel(ch.id);
                               handleFitRollToChannel(ch);
@@ -1969,13 +2104,24 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                     }`}
                   >
                     {isRowHumming ? (
-                      <>
-                        <MicOff className="h-3.5 w-3.5" />
-                        <span>
-                          Stop Hum
-                          {liveHumMidi !== null ? ` (${midiToNoteName(liveHumMidi)})` : ''}
-                        </span>
-                      </>
+                      isHumWaitingForVoice ? (
+                        <>
+                          <Mic className="h-3.5 w-3.5 animate-pulse" />
+                          <span>Waiting for hum (Stop)</span>
+                        </>
+                      ) : (
+                        <>
+                          <MicOff className="h-3.5 w-3.5" />
+                          <span>
+                            Stop Hum · Bar{' '}
+                            {Math.max(
+                              1,
+                              Math.floor(Math.max(0, displayStep) / 16) + 1
+                            )}
+                            {liveHumMidi !== null ? ` (${midiToNoteName(liveHumMidi)})` : ''}
+                          </span>
+                        </>
+                      )
                     ) : (
                       <>
                         <Mic className="h-3.5 w-3.5" />
@@ -2196,9 +2342,9 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                     <div
                       role="group"
                       aria-label="Piano Roll bar selector"
-                      className="flex items-center gap-0.5 rounded-md border border-[#34404E] bg-[#11161C] p-0.5"
+                      className="flex flex-wrap items-center gap-0.5 rounded-md border border-[#34404E] bg-[#11161C] p-0.5"
                     >
-                      {Array.from({ length: loopBars }).map((_, idx) => (
+                      {Array.from({ length: timelineBars }).map((_, idx) => (
                         <button
                           key={idx}
                           type="button"
@@ -2310,7 +2456,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                       <div className="grid grid-cols-16">
                         {Array.from({ length: 16 }).map((_, col) => {
                           const globalStep = barStartStep + col;
-                          const isActiveStep = isPlaying && currentStep === globalStep;
+                          const isActiveStep = isPlaying && displayStep === globalStep;
                           const isBeatStart = col % 4 === 0;
                           return (
                             <div
@@ -2340,8 +2486,8 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                         const rowNotes = selectedChannel.notes.filter(
                           (n) =>
                             n.midi === midi &&
-                            n.step >= barStartStep &&
-                            n.step < barStartStep + 16
+                            n.step < barStartStep + 16 &&
+                            n.step + Math.max(1, n.durationSteps) > barStartStep
                         );
 
                         const ghostRowNotes = showGhostNotes
@@ -2351,8 +2497,8 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                                 other.notes.filter(
                                   (n) =>
                                     n.midi === midi &&
-                                    n.step >= barStartStep &&
-                                    n.step < barStartStep + 16
+                                    n.step < barStartStep + 16 &&
+                                    n.step + Math.max(1, n.durationSteps) > barStartStep
                                 )
                               )
                           : [];
@@ -2383,7 +2529,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                               {Array.from({ length: 16 }).map((_, col) => {
                                 const globalStep = barStartStep + col;
                                 const isBeatBorder = col % 4 === 0 && col > 0;
-                                const isPlayhead = isPlaying && currentStep === globalStep;
+                                const isPlayhead = isPlaying && displayStep === globalStep;
                                 return (
                                   <button
                                     key={col}
@@ -2413,8 +2559,13 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                               })}
 
                               {ghostRowNotes.map((gn, gIdx) => {
-                                const colOffset = gn.step - barStartStep;
-                                const spanCols = Math.min(16 - colOffset, gn.durationSteps);
+                                const clippedStart = Math.max(barStartStep, gn.step);
+                                const clippedEnd = Math.min(
+                                  barStartStep + 16,
+                                  gn.step + Math.max(1, gn.durationSteps)
+                                );
+                                const colOffset = clippedStart - barStartStep;
+                                const spanCols = Math.max(1, clippedEnd - clippedStart);
                                 return (
                                   <span
                                     key={`ghost-${gn.step}-${gIdx}`}
@@ -2428,8 +2579,13 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                               })}
 
                               {rowNotes.map((note, nIdx) => {
-                                const colOffset = note.step - barStartStep;
-                                const spanCols = Math.min(16 - colOffset, note.durationSteps);
+                                const clippedStart = Math.max(barStartStep, note.step);
+                                const clippedEnd = Math.min(
+                                  barStartStep + 16,
+                                  note.step + Math.max(1, note.durationSteps)
+                                );
+                                const colOffset = clippedStart - barStartStep;
+                                const spanCols = Math.max(1, clippedEnd - clippedStart);
                                 const accent = CHANNEL_ACCENT[selectedChannel.color];
                                 return (
                                   <button

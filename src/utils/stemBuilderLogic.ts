@@ -203,7 +203,7 @@ export function toggleStemNote(
     {
       step: safeStep,
       midi: safeMidi,
-      durationSteps: Math.max(1, Math.min(16, Math.round(durationSteps))),
+      durationSteps: Math.max(1, Math.min(32, Math.round(durationSteps))),
       velocity: Math.max(20, Math.min(100, Math.round(velocity))),
     },
   ].sort((a, b) => a.step - b.step || b.midi - a.midi);
@@ -218,7 +218,7 @@ export function upsertStemNote(notes: StemNote[], incoming: StemNote): StemNote[
     {
       step: safeStep,
       midi: safeMidi,
-      durationSteps: Math.max(1, Math.min(16, Math.round(incoming.durationSteps || 2))),
+      durationSteps: Math.max(1, Math.min(32, Math.round(incoming.durationSteps || 2))),
       velocity: Math.max(20, Math.min(100, Math.round(incoming.velocity || 88))),
       ...(typeof incoming.startOffsetSteps === 'number'
         ? { startOffsetSteps: incoming.startOffsetSteps }
@@ -244,7 +244,7 @@ export function extendStemNoteDuration(
 ): StemNote[] {
   const safeStep = Math.max(0, Math.min(2047, Math.round(step)));
   const safeMidi = clampMidi(midi);
-  const safeDur = Math.max(1, Math.min(16, Math.round(durationSteps)));
+  const safeDur = Math.max(1, Math.min(32, Math.round(durationSteps)));
   let changed = false;
   const updated = notes.map((n) => {
     if (n.step === safeStep && n.midi === safeMidi && n.durationSteps !== safeDur) {
@@ -417,6 +417,79 @@ export function computeContinuousStepAtTime(
 }
 
 /**
+ * Computes the monotonic (un-wrapped) continuous 16th-note step at `audioTimeSec`
+ * so extended vocal hums continue linearly into Bar 5, 6, 7, 8+ without wrapping to Bar 1.
+ */
+export function computeMonotonicStepAtTime(
+  timing: PlaybackTimingSnapshot,
+  audioTimeSec: number,
+  latencyCompensationSec = 0
+): number {
+  if (!timing.isPlaying || timing.stepDuration <= 0) return 0;
+  const effectiveTime = audioTimeSec - Math.max(0, latencyCompensationSec);
+  const rawStep =
+    timing.currentStep + (effectiveTime - timing.nextStepTime) / timing.stepDuration;
+  return Math.max(0, rawStep);
+}
+
+export interface HumTakeAnchor {
+  anchorCycleStartGlobalStep: number;
+  onsetPhaseSteps: number;
+  leadSilenceSeconds: number;
+}
+
+/**
+ * Anchors a vocal hum take when the user first starts singing after waiting through
+ * any number of loop cycles. Aligns their voice cleanly inside Beat 1..End of the
+ * active loop cycle (handling pickups right before Beat 1 without adding empty bars).
+ */
+export function computeHumTakeAnchor(
+  globalContinuousStep: number,
+  loopStepCount: number,
+  stepDurationSec: number,
+  preRollDurationSec = 0
+): HumTakeAnchor {
+  const safeLoopSteps = Math.max(16, Math.round(loopStepCount));
+  const safeStepDur = Math.max(0.02, stepDurationSec);
+  const safeGlobal = Math.max(0, globalContinuousStep);
+  const cycleIndex = Math.floor(safeGlobal / safeLoopSteps);
+  const phaseSteps = safeGlobal - cycleIndex * safeLoopSteps;
+
+  // If the singer starts as a pickup within the final 3 sixteenth notes before the next cycle's Beat 1,
+  // anchor directly onto the upcoming Beat 1 so we don't prepend nearly 4 empty bars of silence.
+  if (phaseSteps >= safeLoopSteps - 3) {
+    return {
+      anchorCycleStartGlobalStep: (cycleIndex + 1) * safeLoopSteps,
+      onsetPhaseSteps: 0,
+      leadSilenceSeconds: 0,
+    };
+  }
+
+  return {
+    anchorCycleStartGlobalStep: cycleIndex * safeLoopSteps,
+    onsetPhaseSteps: phaseSteps,
+    leadSilenceSeconds: Math.max(0, phaseSteps * safeStepDur - Math.max(0, preRollDurationSec)),
+  };
+}
+
+/**
+ * Expands the active Stem timeline bar-by-bar smoothly as a singer hums past Bar 4.
+ */
+export function computeLiveExpandedTimelineSteps(
+  currentSteps: number,
+  takeStep: number,
+  baseLoopSteps: number
+): number {
+  const minSteps = Math.max(16, Math.ceil(baseLoopSteps / 16) * 16);
+  const currentBarAligned = Math.max(minSteps, Math.ceil(currentSteps / 16) * 16);
+  if (takeStep < currentBarAligned - 8) {
+    return currentBarAligned;
+  }
+  const needed = Math.ceil((Math.max(0, takeStep) + 12) / 16) * 16;
+  return Math.min(2048, Math.max(currentBarAligned, needed));
+}
+
+/**
  * Computes the exact phase in seconds [0, loopDuration) within the active loop
  * at `audioTimeSec` so recorded vocal samples align dead-on Beat 1..End.
  */
@@ -440,6 +513,7 @@ export interface HumFrameInput {
   clarity: number;
   continuousStep: number;
   stepCount: number;
+  allowExtendedTimeline?: boolean;
 }
 
 export type HumTrackerAction =
@@ -486,6 +560,11 @@ export class HumCaptureTracker {
 
   public processFrame(input: HumFrameInput): HumFrameResult {
     const stepCount = Math.max(1, input.stepCount);
+    const extended = Boolean(input.allowExtendedTimeline);
+    const normalizeStep = (raw: number) =>
+      extended
+        ? Math.max(0, Math.min(2047, Math.round(raw)))
+        : ((Math.round(raw) % stepCount) + stepCount) % stepCount;
 
     if (input.hz === null || !Number.isFinite(input.hz) || input.hz <= 0) {
       this.silentFrames += 1;
@@ -501,8 +580,7 @@ export class HumCaptureTracker {
 
     this.silentFrames = 0;
     const midi = freqToMidi(input.hz);
-    const snappedStep =
-      ((Math.round(input.continuousStep) % stepCount) + stepCount) % stepCount;
+    const snappedStep = normalizeStep(input.continuousStep);
     const velocity = Math.min(
       100,
       Math.max(48, Math.round(52 + Math.min(1, input.rms * 10) * 48))
@@ -545,12 +623,11 @@ export class HumCaptureTracker {
         };
       }
 
-      let elapsed = positiveMod(
-        input.continuousStep - this.activeNote.startContinuous,
-        stepCount
-      );
-      if (elapsed > stepCount * 0.75) elapsed = 0;
-      const heldSteps = Math.max(1, Math.min(16, Math.round(elapsed) + 1));
+      let elapsed = extended
+        ? Math.max(0, input.continuousStep - this.activeNote.startContinuous)
+        : positiveMod(input.continuousStep - this.activeNote.startContinuous, stepCount);
+      if (!extended && elapsed > stepCount * 0.75) elapsed = 0;
+      const heldSteps = Math.max(1, Math.min(32, Math.round(elapsed) + 1));
       this.prevRms = input.rms;
       if (heldSteps > this.activeNote.lastDuration) {
         this.activeNote.lastDuration = heldSteps;
@@ -585,8 +662,7 @@ export class HumCaptureTracker {
       return { liveMidi: midi, action: null };
     }
 
-    const onsetStep =
-      ((Math.round(this.pendingStartContinuous) % stepCount) + stepCount) % stepCount;
+    const onsetStep = normalizeStep(this.pendingStartContinuous);
     this.activeNote = {
       step: onsetStep,
       midi,
@@ -801,6 +877,22 @@ export class ContinuousVocalRecorder {
 
   public getMaxPeak(): number {
     return this.maxPeak;
+  }
+
+  public prependSilenceFrames(frameCount: number): void {
+    const safeFrames = Math.min(
+      Math.max(0, Math.round(frameCount)),
+      Math.max(0, this.maxFrames - this.totalFrames)
+    );
+    if (safeFrames <= 0) return;
+    this.chunks.push(new Float32Array(safeFrames));
+    this.totalFrames += safeFrames;
+  }
+
+  public seedPreRollChunks(chunks: Float32Array[]): void {
+    for (const chunk of chunks) {
+      this.writeChunk(chunk);
+    }
   }
 
   public writeChunk(chunk: Float32Array): void {

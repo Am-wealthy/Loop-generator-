@@ -45,6 +45,7 @@ test('timing helpers calculate 16th note duration and bar.beat.step formatting',
   assert.equal(formatBarBeatStep(0), '01.1.1');
   assert.equal(formatBarBeatStep(17), '02.1.2');
   assert.equal(formatBarBeatStep(63), '04.4.4');
+  assert.equal(formatBarBeatStep(73), '05.3.2');
 });
 
 test('isTrackAudible respects mute and solo precedence', () => {

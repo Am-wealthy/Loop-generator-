@@ -44,8 +44,9 @@ export function getActiveStepCount(loopBars: LoopBars): number {
   return loopBars * 16;
 }
 
-export function formatBarBeatStep(stepIndex: number): string {
-  const safe = Math.max(0, Math.floor(stepIndex)) % 64;
+export function formatBarBeatStep(stepIndex: number, wrapSteps?: number): string {
+  const raw = Math.max(0, Math.floor(stepIndex));
+  const safe = wrapSteps && wrapSteps > 0 ? raw % wrapSteps : raw;
   const bar = Math.floor(safe / 16) + 1;
   const stepInBar = safe % 16;
   const beat = Math.floor(stepInBar / 4) + 1;

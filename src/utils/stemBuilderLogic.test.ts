@@ -4,13 +4,18 @@ import {
   canRedoStemHistory,
   canUndoStemHistory,
   computeContinuousStepAtTime,
+  computeHumTakeAnchor,
+  computeLiveExpandedTimelineSteps,
   computeLoopPhaseSeconds,
+  computeMonotonicStepAtTime,
+  ContinuousVocalRecorder,
   createDefaultStemChannels,
   createStemHistory,
   detectPitchHzAutocorrelation,
   detectPitchInfo,
   extendStemNoteDuration,
   freqToMidi,
+  getSongTimelineSteps,
   HumCaptureTracker,
   isAnyStemSoloed,
   isMidiInScale,
@@ -350,3 +355,92 @@ test('LoopPcmRecorder writes sample-contiguously across timing jitter with zero 
   // At 220Hz @ 48kHz, max sample-to-sample diff of amplitude 0.4 is ~0.0115
   assert.ok(maxStepDiff < 0.02, `Expected smooth waveform without jumps, got maxStepDiff=${maxStepDiff}`);
 });
+
+test('computeHumTakeAnchor waits cleanly past 4 bars and aligns onset to current loop cycle', () => {
+  const stepDur = 0.125; // 120 BPM 16th note
+  // Waited 2 full 4-bar loops (128 steps) and started singing right on Beat 1
+  const beat1AfterWait = computeHumTakeAnchor(128.4, 64, stepDur, 0.25);
+  assert.equal(beat1AfterWait.anchorCycleStartGlobalStep, 128);
+  assert.ok(beat1AfterWait.leadSilenceSeconds < 0.01);
+
+  // Waited 1 loop + 1 bar (80 steps = Bar 2)
+  const bar2Entry = computeHumTakeAnchor(80, 64, stepDur, 0.25);
+  assert.equal(bar2Entry.anchorCycleStartGlobalStep, 64);
+  assert.equal(Math.round(bar2Entry.onsetPhaseSteps), 16);
+  assert.ok(Math.abs(bar2Entry.leadSilenceSeconds - (16 * stepDur - 0.25)) < 0.001);
+
+  // Pickup 1.5 steps before Beat 1 of loop #3 (126.5 of 128) anchors onto upcoming Beat 1 (128)
+  const pickup = computeHumTakeAnchor(126.5, 64, stepDur, 0.25);
+  assert.equal(pickup.anchorCycleStartGlobalStep, 128);
+  assert.equal(pickup.leadSilenceSeconds, 0);
+});
+
+test('computeLiveExpandedTimelineSteps and HumCaptureTracker expand past 4 bars without wrapping', () => {
+  // Stays at 4 bars until approaching the end of Bar 4
+  assert.equal(computeLiveExpandedTimelineSteps(64, 48, 64), 64);
+  // Approaching Bar 4 end -> opens Bar 5 (80 steps)
+  assert.equal(computeLiveExpandedTimelineSteps(64, 58, 64), 80);
+  // Singing in Bar 6 -> expands cleanly to Bar 7 (112 steps)
+  assert.equal(computeLiveExpandedTimelineSteps(80, 100, 64), 112);
+
+  // Extended HumCaptureTracker keeps steps in Bar 5 & Bar 6 instead of wrapping to Bar 1
+  const tracker = new HumCaptureTracker();
+  const res1 = tracker.processFrame({
+    hz: 440,
+    rms: 0.08,
+    clarity: 0.9,
+    continuousStep: 68.1,
+    stepCount: 64,
+    allowExtendedTimeline: true,
+  });
+  assert.equal(res1.action?.type, 'start');
+  assert.equal(res1.action?.note.step, 68);
+
+  const res2 = tracker.processFrame({
+    hz: 523.25,
+    rms: 0.08,
+    clarity: 0.9,
+    continuousStep: 84.2,
+    stepCount: 64,
+    allowExtendedTimeline: true,
+  });
+  assert.equal(res2.action?.type, 'start');
+  assert.equal(res2.action?.note.step, 84);
+
+  const monoStep = computeMonotonicStepAtTime(
+    {
+      isPlaying: true,
+      currentStep: 96,
+      nextStepTime: 10.0,
+      stepDuration: 0.125,
+      stepCount: 64,
+      ctxCurrentTime: 10.0,
+    },
+    10.0,
+    0
+  );
+  assert.equal(monoStep, 96);
+});
+
+test('ContinuousVocalRecorder preserves pre-roll and expands past 4 bars linearly', () => {
+  const sr = 22050;
+  const recorder = new ContinuousVocalRecorder(sr, 60);
+  recorder.prependSilenceFrames(sr * 1); // 1s lead silence
+  const preRoll = new Float32Array(2048).fill(0.15);
+  recorder.seedPreRollChunks([preRoll]);
+  // Add 8 seconds of audio (exceeding typical 4-bar 126bpm ~7.6s duration)
+  for (let i = 0; i < 86; i++) {
+    const chunk = new Float32Array(2048);
+    for (let j = 0; j < chunk.length; j++) {
+      chunk[j] = 0.25 * Math.sin((2 * Math.PI * 330 * j) / sr);
+    }
+    recorder.writeChunk(chunk);
+  }
+  const finalPcm = recorder.finalize();
+  assert.ok(finalPcm !== null);
+  assert.ok(finalPcm.length > sr * 8.5);
+  const steps = Math.ceil((finalPcm.length / sr / 0.12) / 16) * 16;
+  const songSteps = getSongTimelineSteps([{ notes: [], totalSteps: steps }], 64);
+  assert.ok(songSteps >= 80, `Expected extended timeline >= 80 steps, got ${songSteps}`);
+});
+

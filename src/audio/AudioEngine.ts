@@ -318,7 +318,11 @@ export class StudioAudioEngine {
       : percStepCount;
   }
 
-  public setHumRecordingState(active: boolean, muteBackingWhileHum = false): void {
+  public setHumRecordingState(
+    active: boolean,
+    muteBackingWhileHum = false,
+    minTimelineSteps?: number
+  ): void {
     const wasActive = this.isRecordingHum;
     this.isRecordingHum = active;
     this.muteBackingWhileHum = muteBackingWhileHum;
@@ -328,7 +332,10 @@ export class StudioAudioEngine {
         this.currentStep = 0;
       }
     } else if (wasActive && this.isPlaying) {
-      const songSteps = this.getEffectiveStemSongSteps();
+      const songSteps = Math.max(
+        this.getEffectiveStemSongSteps(),
+        minTimelineSteps ?? 0
+      );
       this.currentStep = this.currentStep % Math.max(1, songSteps);
     }
     this.applyBlend();
@@ -773,6 +780,7 @@ export class StudioAudioEngine {
     nextStepTime: number;
     stepDuration: number;
     stepCount: number;
+    loopBedStepCount: number;
     ctxCurrentTime: number;
     baseLatency: number;
     outputLatency: number;
@@ -784,6 +792,7 @@ export class StudioAudioEngine {
       nextStepTime: this.nextStepTime,
       stepDuration: getStepDurationSeconds(this.bpm),
       stepCount: this.getEffectiveStemSongSteps(),
+      loopBedStepCount: getActiveStepCount(this.loopBars),
       ctxCurrentTime: ctx.currentTime,
       baseLatency: typeof ctx.baseLatency === 'number' ? ctx.baseLatency : 0,
       outputLatency: typeof ctx.outputLatency === 'number' ? ctx.outputLatency : 0,

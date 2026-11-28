@@ -38,6 +38,7 @@ import {
   computeContinuousStepAtTime,
   computeLoopPhaseSeconds,
   detectPitchInfo,
+  getSongTimelineSteps,
   HUM_WORKLET_PROCESSOR_CODE,
   HumCaptureTracker,
   isBlackKeyMidi,
@@ -56,6 +57,26 @@ import { PianoKeyboardRow } from './PianoKeyboardRow';
 import { StemVoiceBrowserModal } from './StemVoiceBrowserModal';
 
 const registeredHumWorkletContexts = new WeakSet<AudioContext>();
+
+function extractPcmWaveformPeaks(pcm: Float32Array, bins = 56): number[] {
+  if (pcm.length === 0 || bins <= 0) return [];
+  const blockSize = Math.max(1, Math.floor(pcm.length / bins));
+  const step = Math.max(1, Math.floor(blockSize / 24));
+  const peaks: number[] = [];
+  let maxPeak = 0.001;
+  for (let i = 0; i < bins; i++) {
+    const start = i * blockSize;
+    const end = Math.min(pcm.length, start + blockSize);
+    let peak = 0;
+    for (let j = start; j < end; j += step) {
+      const abs = Math.abs(pcm[j]);
+      if (abs > peak) peak = abs;
+    }
+    if (peak > maxPeak) maxPeak = peak;
+    peaks.push(peak);
+  }
+  return peaks.map((p) => p / maxPeak);
+}
 
 interface StemBuilderStudioProps {
   bpm: number;
@@ -147,37 +168,72 @@ interface StemBuilderStudioProps {
 
 const CHANNEL_ACCENT: Record<
   StemChannel['color'],
-  { border: string; bg: string; noteBg: string; dot: string }
+  {
+    border: string;
+    bg: string;
+    noteBg: string;
+    dot: string;
+    flHeader: string;
+    flHeaderSelected: string;
+    flClipBar: string;
+    flPicker: string;
+    flNoteFill: string;
+  }
 > = {
   amber: {
     border: 'border-amber-500/50',
-    bg: 'bg-amber-500/8',
+    bg: 'bg-amber-500/10',
     noteBg: 'bg-amber-400 text-zinc-950 border-amber-200',
     dot: 'bg-amber-400',
+    flHeader: 'bg-[#256D65] text-zinc-100',
+    flHeaderSelected: 'bg-[#2D857B] text-white',
+    flClipBar: 'bg-[#2C7D74]',
+    flPicker: 'bg-[#286B63] border-[#3C9A8F]',
+    flNoteFill: 'bg-[#6FE3D5]',
   },
   emerald: {
     border: 'border-emerald-500/50',
-    bg: 'bg-emerald-500/8',
+    bg: 'bg-emerald-500/10',
     noteBg: 'bg-emerald-400 text-zinc-950 border-emerald-200',
     dot: 'bg-emerald-400',
+    flHeader: 'bg-[#43713E] text-zinc-100',
+    flHeaderSelected: 'bg-[#4E8548] text-white',
+    flClipBar: 'bg-[#4B8145]',
+    flPicker: 'bg-[#42703E] border-[#66A860]',
+    flNoteFill: 'bg-[#8AE27F]',
   },
   sky: {
     border: 'border-sky-500/50',
-    bg: 'bg-sky-500/8',
+    bg: 'bg-sky-500/10',
     noteBg: 'bg-sky-400 text-zinc-950 border-sky-200',
     dot: 'bg-sky-400',
+    flHeader: 'bg-[#854D34] text-zinc-100',
+    flHeaderSelected: 'bg-[#9E5B3D] text-white',
+    flClipBar: 'bg-[#925438]',
+    flPicker: 'bg-[#824B32] border-[#B87252]',
+    flNoteFill: 'bg-[#F0A47D]',
   },
   violet: {
     border: 'border-violet-500/50',
-    bg: 'bg-violet-500/8',
+    bg: 'bg-violet-500/10',
     noteBg: 'bg-violet-400 text-zinc-950 border-violet-200',
     dot: 'bg-violet-400',
+    flHeader: 'bg-[#7A3B58] text-zinc-100',
+    flHeaderSelected: 'bg-[#924669] text-white',
+    flClipBar: 'bg-[#884162]',
+    flPicker: 'bg-[#763754] border-[#B05C83]',
+    flNoteFill: 'bg-[#E592B8]',
   },
   rose: {
     border: 'border-rose-500/50',
-    bg: 'bg-rose-500/8',
+    bg: 'bg-rose-500/10',
     noteBg: 'bg-rose-400 text-zinc-950 border-rose-200',
     dot: 'bg-rose-400',
+    flHeader: 'bg-[#86632C] text-zinc-100',
+    flHeaderSelected: 'bg-[#9F7635] text-white',
+    flClipBar: 'bg-[#936D31]',
+    flPicker: 'bg-[#87652D] border-[#BF9148]',
+    flNoteFill: 'bg-[#F3C572]',
   },
 };
 
@@ -253,6 +309,10 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
     stemChannels.find((c) => c.id === selectedChannelId) ?? stemChannels[0];
 
   const [mobilePane, setMobilePane] = useState<'rack' | 'pianoroll'>('rack');
+  const [desktopViewMode, setDesktopViewMode] = useState<'split' | 'playlist' | 'pianoroll'>('split');
+  const [inspectorTarget, setInspectorTarget] = useState<'loop' | 'channel'>('channel');
+  const [humPeaksByChannel, setHumPeaksByChannel] = useState<Record<string, number[]>>({});
+
   const [baseOctave, setBaseOctave] = useState<number>(3);
   const [rollTopMidi, setRollTopMidi] = useState<number>(77); // F5 .. E4 (shows Row 2 lead melody)
   const [noteDurationSteps, setNoteDurationSteps] = useState<number>(2);
@@ -534,6 +594,8 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
         }
         const buffer = sharedCtx.createBuffer(1, finalPcm.length, sharedCtx.sampleRate);
         buffer.getChannelData(0).set(finalPcm);
+        const peaks = extractPcmWaveformPeaks(finalPcm, 64);
+        setHumPeaksByChannel((prev) => ({ ...prev, [targetChannelId]: peaks }));
         onSaveHumBufferRef.current?.(targetChannelId, buffer);
         setHumStatusText(
           `Analyzing quiet details, fast notes & pitch bends on ${channel.name} with Basic Pitch...`
@@ -871,9 +933,22 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
   const voiceBrowserTarget =
     stemChannels.find((c) => c.id === voiceBrowserChannelId) ?? null;
 
+  const songTimelineSteps = useMemo(
+    () => Math.max(64, getSongTimelineSteps(stemChannels, activeStepsCount)),
+    [stemChannels, activeStepsCount]
+  );
+  const timelineBars = Math.max(4, Math.ceil(songTimelineSteps / 16));
+  const playheadPercent =
+    isPlaying && currentStep >= 0
+      ? ((currentStep % songTimelineSteps) / songTimelineSteps) * 100
+      : 0;
+
+  const effectiveInspectorMode =
+    inspectorTarget === 'loop' || !selectedChannel ? 'loop' : 'channel';
+
   return (
-    <div className="space-y-3.5">
-      {/* Hidden input for uploading Phone Audio Loop into Row 1 */}
+    <div className="space-y-3 pb-14 lg:pb-4">
+      {/* Hidden input for uploading Phone Audio Loop into Track 01 */}
       <input
         ref={phoneFileInputRef}
         type="file"
@@ -882,20 +957,23 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
         onChange={(e) => void handlePhoneLoopFileChange(e)}
       />
 
-      {/* Compact Unified Studio Command Bar */}
-      <section className="rounded-xl border border-zinc-800 bg-[#111114] px-3.5 py-3 sm:px-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          {/* Left: Studio Title + Key/Scale + Undo/Redo Traverse Arrows */}
-          <div className="flex flex-wrap items-center gap-2.5">
+      {/* TOP FL-STUDIO PLAYLIST TOOLBAR */}
+      <section className="rounded-xl border border-[#2F3A47] bg-[#1A2027] px-3 py-2.5 sm:px-4">
+        <div className="flex flex-wrap items-center justify-between gap-2.5">
+          {/* Left: Arrangement Title + Key/Scale + Prev/Next History Arrows */}
+          <div className="flex flex-wrap items-center gap-2">
             <div className="flex items-center gap-2 pr-1">
               <Layers className="h-4 w-4 text-amber-400" />
-              <h1 className="font-display text-sm font-bold tracking-tight text-zinc-100 sm:text-base">
-                Stem Studio
+              <h1 className="font-display text-sm font-bold tracking-tight text-zinc-100 sm:text-base whitespace-nowrap">
+                Playlist · Arrangement
               </h1>
+              <span className="hidden font-mono-tabular text-[11px] text-zinc-400 md:inline">
+                · {bpm} BPM · {timelineBars} Bars
+              </span>
             </div>
 
             {/* Key & Scale */}
-            <div className="flex h-8 items-center gap-1.5 rounded-lg border border-zinc-800 bg-zinc-950 px-2.5">
+            <div className="flex h-8 items-center gap-1.5 rounded-md border border-[#34404E] bg-[#13181E] px-2.5">
               <label htmlFor="stem-key-select" className="text-[11px] font-medium text-zinc-400">
                 Key
               </label>
@@ -911,7 +989,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                   </option>
                 ))}
               </select>
-              <span className="text-zinc-700" aria-hidden="true">/</span>
+              <span className="text-zinc-600" aria-hidden="true">/</span>
               <select
                 aria-label="Musical scale"
                 value={scaleType}
@@ -934,15 +1012,15 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
             <div
               role="group"
               aria-label="Traverse edit history"
-              className="flex h-8 items-center gap-0.5 rounded-lg border border-zinc-800 bg-zinc-950 p-0.5"
+              className="flex h-8 items-center gap-0.5 rounded-md border border-[#34404E] bg-[#13181E] p-0.5"
             >
               <button
                 type="button"
                 onClick={onUndo}
                 disabled={!canUndo}
-                aria-label="Undo previous change"
+                aria-label="Prev — Undo change"
                 title="Previous step (Ctrl+Z)"
-                className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-semibold text-zinc-200 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-35"
+                className="flex h-7 items-center gap-1 rounded px-2 text-xs font-semibold text-zinc-200 transition-colors hover:bg-[#242C36] disabled:cursor-not-allowed disabled:opacity-35"
               >
                 <ArrowLeft className="h-3.5 w-3.5" />
                 <span className="hidden sm:inline">Prev</span>
@@ -951,9 +1029,9 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                 type="button"
                 onClick={onRedo}
                 disabled={!canRedo}
-                aria-label="Redo forward change"
+                aria-label="Next — Redo change"
                 title="Forward step (Ctrl+Shift+Z)"
-                className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-semibold text-zinc-200 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-35"
+                className="flex h-7 items-center gap-1 rounded px-2 text-xs font-semibold text-zinc-200 transition-colors hover:bg-[#242C36] disabled:cursor-not-allowed disabled:opacity-35"
               >
                 <span className="hidden sm:inline">Next</span>
                 <ArrowRight className="h-3.5 w-3.5" />
@@ -961,17 +1039,17 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
             </div>
           </div>
 
-          {/* Right: Active Row Correction & Hum Capture */}
-          <div className="flex flex-wrap items-center gap-2">
+          {/* Right: Pitch Correction + Add Track + Workspace Mode */}
+          <div className="flex flex-wrap items-center gap-1.5">
             {selectedChannel && (
               <>
                 <button
                   type="button"
                   onClick={() => onFixOffKeyNotes(selectedChannel.id)}
-                  className={`flex h-8 items-center gap-1.5 rounded-lg border px-2.5 text-xs font-semibold transition-colors whitespace-nowrap ${
+                  className={`flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-xs font-semibold transition-colors whitespace-nowrap ${
                     offKeyCountOnSelected > 0
-                      ? 'border-rose-500/50 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25'
-                      : 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
+                      ? 'border-rose-500/60 bg-rose-500/15 text-rose-300 hover:bg-rose-500/25'
+                      : 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300 hover:bg-emerald-500/20'
                   }`}
                 >
                   {offKeyCountOnSelected > 0 ? (
@@ -987,36 +1065,76 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                   )}
                 </button>
 
-                <div className="flex h-8 items-center rounded-lg border border-zinc-800 bg-zinc-950 p-0.5">
+                <div className="flex h-8 items-center rounded-md border border-[#34404E] bg-[#13181E] p-0.5">
                   <button
                     type="button"
                     onClick={() => onTransposeChannel(selectedChannel.id, -1)}
-                    className="h-7 rounded px-2 font-mono-tabular text-[11px] font-semibold text-zinc-300 hover:bg-zinc-800"
-                    title="Transpose selected row down 1 semitone"
+                    className="h-7 rounded px-2 font-mono-tabular text-[11px] font-semibold text-zinc-300 hover:bg-[#242C36]"
+                    title="Transpose selected track down 1 semitone"
                   >
                     -1 st
                   </button>
                   <button
                     type="button"
                     onClick={() => onTransposeChannel(selectedChannel.id, 1)}
-                    className="h-7 rounded px-2 font-mono-tabular text-[11px] font-semibold text-zinc-300 hover:bg-zinc-800"
-                    title="Transpose selected row up 1 semitone"
+                    className="h-7 rounded px-2 font-mono-tabular text-[11px] font-semibold text-zinc-300 hover:bg-[#242C36]"
+                    title="Transpose selected track up 1 semitone"
                   >
                     +1 st
                   </button>
                 </div>
               </>
             )}
+
+            <button
+              type="button"
+              onClick={() => {
+                setInspectorTarget('channel');
+                onAddChannel();
+              }}
+              className="flex h-8 items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/15 px-2.5 text-xs font-semibold text-amber-300 transition-colors hover:bg-amber-500/25 whitespace-nowrap"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              <span>Add Row</span>
+            </button>
+
+            {/* Desktop Split / Playlist / Piano Roll Switcher */}
+            <div
+              role="group"
+              aria-label="Workspace layout"
+              className="hidden h-8 items-center gap-0.5 rounded-md border border-[#34404E] bg-[#13181E] p-0.5 lg:flex"
+            >
+              {(
+                [
+                  { id: 'split', label: 'Split' },
+                  { id: 'playlist', label: 'Playlist' },
+                  { id: 'pianoroll', label: 'Piano Roll' },
+                ] as const
+              ).map((view) => (
+                <button
+                  key={view.id}
+                  type="button"
+                  onClick={() => setDesktopViewMode(view.id)}
+                  className={`h-7 rounded px-2 text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                    desktopViewMode === view.id
+                      ? 'bg-amber-500 text-zinc-950'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  {view.label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
         {(humStatusText || humError || phoneUploadError || hummingChannelId) && (
           <div
             role={humError || phoneUploadError ? 'alert' : 'status'}
-            className={`mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-1.5 text-xs ${
+            className={`mt-2.5 flex flex-wrap items-center justify-between gap-2 rounded-md border px-3 py-1.5 text-xs ${
               humError || phoneUploadError
                 ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
-                : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+                : 'border-amber-500/35 bg-amber-500/10 text-amber-200'
             }`}
           >
             <span className="min-w-0 flex-1">
@@ -1062,7 +1180,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
       <div
         role="tablist"
         aria-label="Stem workspace panes"
-        className="grid grid-cols-2 gap-1 rounded-xl border border-zinc-800 bg-[#111114] p-1 lg:hidden"
+        className="grid grid-cols-2 gap-1 rounded-xl border border-[#2F3A47] bg-[#1A2027] p-1 lg:hidden"
       >
         <button
           type="button"
@@ -1075,7 +1193,7 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
               : 'text-zinc-400 hover:text-zinc-200'
           }`}
         >
-          Channel Rack (All Sequences)
+          Playlist Arrangement
         </button>
         <button
           type="button"
@@ -1092,501 +1210,807 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
         </button>
       </div>
 
-      {/* MAIN 2-PANE SPLIT WORKSPACE */}
-      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-12">
-        {/* LEFT PANE: FL-Studio Style Unified Channel Rack (All Sequences Visible) */}
+      {/* SECTION 1: FL STUDIO PLAYLIST — ARRANGEMENT CANVAS (Pickers + Track Headers + Clips Timeline) */}
+      {(desktopViewMode !== 'pianoroll' || mobilePane === 'rack') && (
         <section
           aria-label="Channel Rack — All Sequences"
-          className={`rounded-xl border border-zinc-800 bg-[#111114] p-3.5 sm:p-4 lg:col-span-5 ${
-            mobilePane === 'rack' ? 'block' : 'hidden lg:block'
-          }`}
+          className={`overflow-hidden rounded-xl border border-[#2F3A47] bg-[#202730] shadow-inner ${
+            mobilePane === 'rack' ? 'block' : 'hidden'
+          } ${desktopViewMode === 'pianoroll' ? 'lg:hidden' : 'lg:block'}`}
         >
-          <div className="mb-3 flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <Music2 className="h-4 w-4 text-amber-400" />
-              <h2 className="text-xs font-bold tracking-wide text-zinc-100 uppercase">
-                Channel Rack · {stemChannels.length + 1} Rows
-              </h2>
-            </div>
-
-            <button
-              type="button"
-              onClick={onAddChannel}
-              className="flex h-8 items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 text-xs font-semibold text-zinc-100 transition-colors hover:border-amber-500/50 hover:text-amber-300 whitespace-nowrap"
+          <div className="grid grid-cols-1 lg:grid-cols-[152px_1fr]">
+            {/* Far-Left FL Studio Pattern & Audio Clip Picker Sidebar */}
+            <aside
+              aria-label="Pattern and Clip Picker"
+              className="hidden flex-col border-r border-[#2F3A47] bg-[#171D24] lg:flex"
             >
-              <Plus className="h-3.5 w-3.5" />
-              <span>Add Row</span>
-            </button>
-          </div>
+              <div className="flex h-8 items-center justify-between border-b border-[#2F3A47] px-2.5 text-[10px] font-bold tracking-wider text-zinc-400 uppercase">
+                <span>Clip Picker</span>
+                <span className="font-mono-tabular text-zinc-500">
+                  {stemChannels.length + 1}
+                </span>
+              </div>
 
-          <div className="space-y-2.5">
-            {/* ROW 1: Master Loop Bed (App Sequencer, App Tap Loop, OR Phone Audio Upload) */}
-            <div
-              data-testid="stem-row-01"
-              className={`rounded-lg border p-3 transition-colors ${
-                stemLoopSoloed
-                  ? 'border-amber-500/60 bg-amber-500/10'
-                  : 'border-zinc-800 bg-zinc-950/90'
-              }`}
-            >
-              <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex-1 space-y-1 p-1.5">
+                {/* Clip 01: Loop Bed */}
                 <button
                   type="button"
-                  onClick={onToggleLoopSolo}
-                  aria-label={`Click to hear only Row 1 loop`}
-                  className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                >
-                  <span className="font-mono-tabular flex h-6 w-6 shrink-0 items-center justify-center rounded bg-amber-500/20 text-[10px] font-bold text-amber-300">
-                    01
-                  </span>
-                  <div className="min-w-0">
-                    <div className="truncate text-xs font-bold text-zinc-100">
-                      {stemLoopSource === 'phone_audio'
-                        ? phoneLoopFileName || 'Phone Audio Loop'
-                        : stemLoopSource === 'taploop'
-                        ? 'Website Tap Loop'
-                        : 'Website Sequencer Loop'}
-                    </div>
-                    <div className="font-mono-tabular text-[10px] text-zinc-400">
-                      {stemLoopSoloed ? 'Hearing Only · ' : ''}
-                      {stemLoopSource === 'phone_audio'
-                        ? phoneLoopFileName
-                          ? `${Math.round(phoneLoopDurationSec)}s phone loop`
-                          : 'Choose an audio file from your phone'
-                        : `${activeLoopElementsCount} layers · ${loopBars}B · ${bpm} BPM`}
-                    </div>
-                  </div>
-                </button>
-
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={onToggleLoopSolo}
-                    aria-pressed={stemLoopSoloed}
-                    aria-label={stemLoopSoloed ? 'Stop hearing only Row 1' : 'Hear only Row 1 loop'}
-                    className={`flex h-7 items-center gap-1 rounded border px-2 text-[10px] font-bold transition-colors whitespace-nowrap ${
-                      stemLoopSoloed
-                        ? 'border-amber-400 bg-amber-500 text-zinc-950'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-amber-500/50 hover:text-amber-300'
-                    }`}
-                  >
-                    <span>{stemLoopSoloed ? 'Only On' : 'Hear Only'}</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={onToggleLoopMuted}
-                    aria-pressed={stemLoopMuted}
-                    aria-label={stemLoopMuted ? 'Unmute Row 1 loop' : 'Mute Row 1 loop'}
-                    className={`flex h-7 w-7 items-center justify-center rounded border transition-colors ${
-                      stemLoopMuted
-                        ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
-                        : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:text-white'
-                    }`}
-                  >
-                    {stemLoopMuted ? (
-                      <VolumeX className="h-3.5 w-3.5" />
-                    ) : (
-                      <Volume2 className="h-3.5 w-3.5" />
-                    )}
-                  </button>
-                  <div className="flex items-center gap-1">
-                    <input
-                      type="range"
-                      min={-60}
-                      max={6}
-                      step={0.5}
-                      value={stemLoopVolumeDb}
-                      onChange={(e) => onLoopVolumeChange(Number(e.target.value))}
-                      aria-label="Row 1 loop volume"
-                      className="studio-slider w-14 sm:w-16"
-                    />
-                    <span className="font-mono-tabular w-11 text-right text-[10px] text-zinc-400">
-                      {formatVolumeDb(stemLoopVolumeDb)}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Row 1 Source Switcher: Website Loop vs Phone Audio */}
-              <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-                <div
-                  role="group"
-                  aria-label="Row 1 loop source"
-                  className="grid min-w-0 basis-full grid-cols-3 gap-0.5 rounded-lg border border-zinc-800 bg-zinc-900/70 p-0.5 sm:basis-auto sm:flex-1"
-                >
-                  <button
-                    type="button"
-                    onClick={() => onSelectLoopSource('sequencer')}
-                    aria-pressed={stemLoopSource === 'sequencer'}
-                    className={`truncate rounded-md px-1.5 py-1 text-[10px] font-semibold transition-colors sm:px-2 sm:text-[11px] ${
-                      stemLoopSource === 'sequencer'
-                        ? 'bg-amber-500 text-zinc-950'
-                        : 'text-zinc-400 hover:text-zinc-200'
-                    }`}
-                  >
-                    Sequencer
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onSelectLoopSource('taploop')}
-                    aria-pressed={stemLoopSource === 'taploop'}
-                    className={`truncate rounded-md px-1.5 py-1 text-[10px] font-semibold transition-colors sm:px-2 sm:text-[11px] ${
-                      stemLoopSource === 'taploop'
-                        ? 'bg-emerald-500 text-zinc-950'
-                        : 'text-zinc-400 hover:text-zinc-200'
-                    }`}
-                  >
-                    Tap Loop
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (phoneLoopFileName) {
-                        onSelectLoopSource('phone_audio');
-                      } else {
-                        phoneFileInputRef.current?.click();
-                      }
-                    }}
-                    aria-pressed={stemLoopSource === 'phone_audio'}
-                    className={`truncate rounded-md px-1.5 py-1 text-[10px] font-semibold transition-colors sm:px-2 sm:text-[11px] ${
-                      stemLoopSource === 'phone_audio'
-                        ? 'bg-sky-400 text-zinc-950'
-                        : 'text-zinc-400 hover:text-zinc-200'
-                    }`}
-                  >
-                    Phone Loop
-                  </button>
-                </div>
-
-                <button
-                  type="button"
-                  disabled={isUploadingPhoneLoop}
-                  onClick={() => phoneFileInputRef.current?.click()}
-                  className="flex h-7 items-center gap-1 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 text-[11px] font-semibold text-zinc-200 hover:border-sky-400/50 hover:text-sky-300 disabled:opacity-60 whitespace-nowrap"
-                >
-                  <Upload className="h-3 w-3" />
-                  <span>
-                    {isUploadingPhoneLoop
-                      ? 'Loading...'
-                      : phoneLoopFileName
-                      ? 'Replace'
-                      : 'Upload'}
-                  </span>
-                </button>
-
-                {phoneLoopFileName && (
-                  <button
-                    type="button"
-                    onClick={onClearPhoneLoopFile}
-                    aria-label="Remove phone loop"
-                    className="flex h-7 w-7 items-center justify-center rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-rose-500/40 hover:text-rose-300"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
-                )}
-              </div>
-
-              {/* Row 1 64-Step / Waveform Strip */}
-              <div
-                aria-label="Row 1 loop sequence overview"
-                className="mt-2.5 grid h-7 grid-cols-16 gap-px rounded border border-zinc-800/80 bg-zinc-900/60 p-1"
-              >
-                {stemLoopSource === 'phone_audio' && phoneLoopPeaks.length > 0
-                  ? Array.from({ length: 16 }).map((_, groupIdx) => {
-                      const peakSlice = phoneLoopPeaks.slice(groupIdx * 3, groupIdx * 3 + 3);
-                      const isPlayheadHere =
-                        isPlaying &&
-                        currentStep >= groupIdx * 4 &&
-                        currentStep < groupIdx * 4 + 4;
-                      return (
-                        <div
-                          key={groupIdx}
-                          className={`flex items-center gap-px px-px ${
-                            isPlayheadHere ? 'bg-sky-400/20' : ''
-                          }`}
-                        >
-                          {peakSlice.map((pk, subIdx) => (
-                            <div
-                              key={subIdx}
-                              style={{ height: `${Math.max(18, Math.round(pk * 100))}%` }}
-                              className={`flex-1 rounded-xs ${
-                                stemLoopMuted ? 'bg-zinc-600' : 'bg-sky-400/85'
-                              }`}
-                            />
-                          ))}
-                        </div>
-                      );
-                    })
-                  : Array.from({ length: 16 }).map((_, groupIdx) => {
-                      const start = groupIdx * 4;
-                      const slice = loopBedStepCounts.slice(start, start + 4);
-                      const maxHits = Math.max(0, ...slice);
-                      const inActiveRange = start < activeStepsCount;
-                      const isPlayheadHere =
-                        currentStep >= start && currentStep < start + 4 && isPlaying;
-                      return (
-                        <div
-                          key={groupIdx}
-                          className={`flex items-end gap-px rounded-xs px-px ${
-                            groupIdx % 4 === 0 ? 'border-l border-zinc-700/80' : ''
-                          } ${!inActiveRange ? 'opacity-25' : ''} ${
-                            isPlayheadHere ? 'bg-amber-500/20' : ''
-                          }`}
-                        >
-                          {slice.map((cnt, subIdx) => (
-                            <div
-                              key={subIdx}
-                              style={{
-                                height:
-                                  cnt > 0 ? `${Math.min(100, 28 + cnt * 18)}%` : '14%',
-                              }}
-                              className={`flex-1 rounded-xs ${
-                                cnt > 0
-                                  ? stemLoopMuted
-                                    ? 'bg-zinc-600'
-                                    : maxHits > 1
-                                    ? 'bg-amber-400'
-                                    : 'bg-emerald-400/80'
-                                  : 'bg-zinc-800/70'
-                              }`}
-                            />
-                          ))}
-                        </div>
-                      );
-                    })}
-              </div>
-            </div>
-
-            {/* ROWS 2, 3, 4...: Melodic / Hum Stem Rows inside the same Channel Rack */}
-            {stemChannels.map((ch, idx) => {
-              const rowNumber = String(idx + 2).padStart(2, '0');
-              const isSelected = selectedChannel?.id === ch.id;
-              const isRowHumming = hummingChannelId === ch.id;
-              const isRowPlayingHum = playingHumChannelId === ch.id;
-              const accent = CHANNEL_ACCENT[ch.color];
-              const channelOffKeyCount = ch.notes.filter(
-                (n) => !isMidiInScale(n.midi, rootKey, scaleType)
-              ).length;
-
-              return (
-                <div
-                  key={ch.id}
-                  data-testid={`stem-row-${rowNumber}`}
-                  className={`rounded-lg border p-3 transition-colors ${
-                    isSelected
-                      ? `${accent.border} ${accent.bg}`
-                      : 'border-zinc-800/90 bg-zinc-950/75 hover:border-zinc-700'
+                  onClick={() => setInspectorTarget('loop')}
+                  className={`flex w-full items-center justify-between gap-1.5 rounded-sm border px-2 py-1.5 text-left text-[11px] font-semibold transition-all ${
+                    effectiveInspectorMode === 'loop'
+                      ? 'border-sky-300 bg-[#3B6A90] text-white shadow-sm'
+                      : 'border-[#3D6A8F]/60 bg-[#2A4B66] text-zinc-100 hover:bg-[#335B7B]'
                   }`}
                 >
-                  {/* Row Header: Select Button + S/M/Delete */}
-                  <div className="flex items-center justify-between gap-2">
+                  <span className="truncate">
+                    {stemLoopSource === 'phone_audio'
+                      ? phoneLoopFileName || 'Phone Audio'
+                      : stemLoopSource === 'taploop'
+                      ? 'Tap Loop'
+                      : 'Sequencer Loop'}
+                  </span>
+                  <span className="font-mono-tabular text-[9px] opacity-80">01</span>
+                </button>
+
+                {/* Melodic & Hum Clips */}
+                {stemChannels.map((ch, idx) => {
+                  const accent = CHANNEL_ACCENT[ch.color];
+                  const isSelected =
+                    effectiveInspectorMode === 'channel' && selectedChannel?.id === ch.id;
+                  return (
                     <button
+                      key={ch.id}
                       type="button"
                       onClick={() => {
+                        setInspectorTarget('channel');
                         onSelectChannel(ch.id);
                         handleFitRollToChannel(ch);
                       }}
-                      className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                      className={`flex w-full items-center justify-between gap-1.5 rounded-sm border px-2 py-1.5 text-left text-[11px] font-semibold text-white transition-all ${
+                        accent.flPicker
+                      } ${isSelected ? 'ring-1 ring-amber-300 brightness-110' : 'opacity-90 hover:opacity-100'}`}
                     >
-                      <span
-                        className={`font-mono-tabular flex h-6 w-6 shrink-0 items-center justify-center rounded text-[10px] font-bold text-zinc-950 ${accent.dot}`}
-                      >
-                        {rowNumber}
+                      <span className="truncate">
+                        {ch.name.replace(/^Row \d+\s*·\s*/, '')}
                       </span>
-                      <div className="min-w-0">
+                      <span className="font-mono-tabular text-[9px] opacity-80">
+                        {String(idx + 2).padStart(2, '0')}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="border-t border-[#2F3A47] p-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setInspectorTarget('channel');
+                    onAddChannel();
+                  }}
+                  className="flex h-7 w-full items-center justify-center gap-1 rounded-sm border border-dashed border-[#3E4C5C] bg-[#1E252E] text-[10px] font-semibold text-zinc-300 hover:border-amber-400/60 hover:text-amber-300"
+                >
+                  <Plus className="h-3 w-3" />
+                  <span>New Track</span>
+                </button>
+              </div>
+            </aside>
+
+            {/* Right Area: Aligned Track Headers + Multi-Bar Arrangement Grid */}
+            <div className="min-w-0 overflow-x-auto [--track-header-w:156px] sm:[--track-header-w:220px]">
+              <div className="min-w-[640px]">
+                {/* Timeline Bar Ruler */}
+                <div className="flex h-8 border-b border-[#2F3A47] bg-[#171D24]">
+                  <div className="sticky left-0 z-20 flex w-[156px] shrink-0 items-center justify-between border-r border-[#2F3A47] bg-[#171D24] px-2.5 text-[10px] font-bold tracking-wider text-zinc-400 uppercase sm:w-[220px]">
+                    <span>Tracks ({stemChannels.length + 1})</span>
+                    <span className="hidden font-mono-tabular text-zinc-500 sm:inline">
+                      Click row
+                    </span>
+                  </div>
+
+                  <div
+                    className="relative grid flex-1"
+                    style={{
+                      gridTemplateColumns: `repeat(${timelineBars}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    {Array.from({ length: timelineBars }).map((_, barIdx) => {
+                      const isCurrentRollBar = barOffset === barIdx;
+                      return (
+                        <button
+                          key={barIdx}
+                          type="button"
+                          onClick={() => {
+                            if (barIdx < loopBars) {
+                              onSelectBar(barIdx);
+                            }
+                          }}
+                          className={`relative flex items-center justify-between border-r border-[#333F4D] px-2 text-left font-mono-tabular text-[11px] font-bold transition-colors ${
+                            isCurrentRollBar
+                              ? 'bg-[#25303C] text-amber-300'
+                              : 'text-zinc-400 hover:bg-[#1E2630] hover:text-zinc-200'
+                          }`}
+                          title={`Bar ${barIdx + 1}`}
+                        >
+                          <span>{barIdx + 1}</span>
+                          <div className="flex items-end gap-2 opacity-40">
+                            <span className="h-1.5 w-px bg-zinc-400" />
+                            <span className="h-1 w-px bg-zinc-500" />
+                            <span className="h-1.5 w-px bg-zinc-400" />
+                          </div>
+                        </button>
+                      );
+                    })}
+
+                    {/* Playhead Triangle on Ruler */}
+                    {isPlaying && currentStep >= 0 && (
+                      <div
+                        style={{ left: `${playheadPercent}%` }}
+                        className="pointer-events-none absolute top-0 bottom-0 z-20 -translate-x-1/2"
+                      >
+                        <div className="mx-auto h-0 w-0 border-x-[5px] border-t-[7px] border-x-transparent border-t-amber-400" />
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Track Lanes Body (with unified full-height Playhead cursor) */}
+                <div className="relative">
+                  {isPlaying && currentStep >= 0 && (
+                    <div
+                      style={{
+                        left: `calc(var(--track-header-w) + (100% - var(--track-header-w)) * ${playheadPercent / 100})`,
+                      }}
+                      className="pointer-events-none absolute inset-y-0 z-20 w-[1.5px] bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.7)]"
+                    />
+                  )}
+
+                  {/* ROW 01: Master Loop Bed Track */}
+                  <div
+                    data-testid="stem-row-01"
+                    className="flex h-[62px] border-b border-[#2C3643]"
+                  >
+                    {/* Track 01 Header Block (FL Studio Steel Blue) */}
+                    <div
+                      className={`sticky left-0 z-10 flex w-[156px] shrink-0 items-center justify-between gap-1.5 border-r border-[#2F3A47] px-2 py-1.5 transition-colors sm:w-[220px] sm:gap-2 sm:px-2.5 ${
+                        effectiveInspectorMode === 'loop'
+                          ? 'bg-[#365C7C] text-white'
+                          : 'bg-[#29445B] text-zinc-100 hover:bg-[#30506B]'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setInspectorTarget('loop')}
+                        className="min-w-0 flex-1 text-left focus:outline-none"
+                      >
                         <div className="flex items-center gap-1.5">
-                          <span className="truncate text-xs font-bold text-zinc-100">
-                            {ch.name}
+                          <span className="font-mono-tabular text-[10px] font-bold opacity-75">
+                            01
                           </span>
-                          {channelOffKeyCount > 0 && (
-                            <span className="font-mono-tabular text-[10px] font-semibold text-rose-400">
-                              · {channelOffKeyCount} off-key
-                            </span>
-                          )}
+                          <span className="truncate text-xs font-bold">
+                            {stemLoopSource === 'phone_audio'
+                              ? phoneLoopFileName || 'Phone Audio'
+                              : stemLoopSource === 'taploop'
+                              ? 'Tap Loop'
+                              : 'Sequencer Loop'}
+                          </span>
                         </div>
-                        <div className="font-mono-tabular text-[10px] text-zinc-400">
-                          {ch.notes.length} notes
-                          {ch.hasHumAudio ? ' · Hum recorded' : ''}
-                          {ch.voiceMode === 'custom_sample' && ch.customVoiceSample
-                            ? ` · ${ch.customVoiceSample.name}`
-                            : ''}
+                        <div className="truncate font-mono-tabular text-[10px] opacity-80">
+                          {stemLoopSoloed ? 'Soloed · ' : ''}
+                          {stemLoopSource === 'phone_audio'
+                            ? phoneLoopFileName
+                              ? `${Math.round(phoneLoopDurationSec)}s phone WAV`
+                              : 'Upload phone loop'
+                            : `${activeLoopElementsCount} layers · ${loopBars}B`}
+                        </div>
+                      </button>
+
+                      <div className="flex shrink-0 items-center gap-1 sm:gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setInspectorTarget('loop');
+                            onToggleLoopSolo();
+                          }}
+                          aria-pressed={stemLoopSoloed}
+                          aria-label={stemLoopSoloed ? 'Stop hearing only Row 1' : 'Hear only Row 1 loop'}
+                          className={`rounded px-1.5 py-0.5 text-[9px] font-bold transition-colors ${
+                            stemLoopSoloed
+                              ? 'bg-amber-400 text-zinc-950'
+                              : 'bg-black/25 text-zinc-200 hover:bg-black/40'
+                          }`}
+                        >
+                          S
+                        </button>
+                        <button
+                          type="button"
+                          onClick={onToggleLoopMuted}
+                          aria-pressed={stemLoopMuted}
+                          aria-label={stemLoopMuted ? 'Unmute Row 1 loop' : 'Mute Row 1 loop'}
+                          title={stemLoopMuted ? 'Unmute track' : 'Mute track'}
+                          className="flex h-5 w-5 items-center justify-center rounded bg-black/25 hover:bg-black/45"
+                        >
+                          <span
+                            className={`h-2.5 w-2.5 rounded-full transition-colors ${
+                              stemLoopMuted
+                                ? 'bg-zinc-600'
+                                : 'bg-[#8CE94A] shadow-[0_0_6px_rgba(140,233,74,0.75)]'
+                            }`}
+                          />
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Track 01 Timeline Clip Lane */}
+                    <div
+                      onClick={() => setInspectorTarget('loop')}
+                      className="relative flex-1 cursor-pointer bg-[#232B34]"
+                    >
+                      {/* Bar + 4-Beat Gridlines */}
+                      <div
+                        className="pointer-events-none absolute inset-0 grid"
+                        style={{
+                          gridTemplateColumns: `repeat(${timelineBars}, minmax(0, 1fr))`,
+                        }}
+                      >
+                        {Array.from({ length: timelineBars }).map((_, b) => (
+                          <div
+                            key={b}
+                            className={`grid grid-cols-4 border-r border-[#333F4D] ${
+                              b % 2 === 1 ? 'bg-black/10' : ''
+                            }`}
+                          >
+                            <span className="border-r border-white/[0.04]" />
+                            <span className="border-r border-white/[0.04]" />
+                            <span className="border-r border-white/[0.04]" />
+                            <span />
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* FL Clip Block */}
+                      <div
+                        style={{
+                          left: '0%',
+                          width: `${(loopBars / timelineBars) * 100}%`,
+                        }}
+                        className={`absolute inset-y-1 flex flex-col overflow-hidden rounded-sm border ${
+                          stemLoopMuted
+                            ? 'border-zinc-600/70 opacity-50'
+                            : effectiveInspectorMode === 'loop'
+                            ? 'border-sky-300/80 shadow-sm'
+                            : 'border-[#487CA8]/80'
+                        }`}
+                      >
+                        {/* Colored Clip Top Bar */}
+                        <div className="flex h-4 shrink-0 items-center justify-between bg-[#3E6E94] px-2 text-[10px] font-bold text-white">
+                          <span className="truncate">
+                            {stemLoopSource === 'phone_audio'
+                              ? phoneLoopFileName || 'Phone Audio Clip'
+                              : stemLoopSource === 'taploop'
+                              ? 'Tap Loop Pattern'
+                              : 'Sequencer Pattern'}
+                          </span>
+                          <span className="font-mono-tabular text-[9px] opacity-85">
+                            {loopBars} Bars
+                          </span>
+                        </div>
+
+                        {/* Clip Body: Real Waveform OR Percussion Rhythm Bars */}
+                        <div className="flex flex-1 items-center gap-px bg-[#151C24]/90 px-1">
+                          {stemLoopSource === 'phone_audio' && phoneLoopPeaks.length > 0
+                            ? phoneLoopPeaks.slice(0, 64).map((pk, idx) => (
+                                <div
+                                  key={idx}
+                                  style={{
+                                    height: `${Math.max(18, Math.round(pk * 92))}%`,
+                                  }}
+                                  className="flex-1 rounded-xs bg-zinc-100/90"
+                                />
+                              ))
+                            : loopBedStepCounts.slice(0, loopBars * 16).map((cnt, sIdx) => (
+                                <div
+                                  key={sIdx}
+                                  style={{
+                                    height:
+                                      cnt > 0
+                                        ? `${Math.min(92, 26 + cnt * 18)}%`
+                                        : '10%',
+                                  }}
+                                  className={`flex-1 rounded-xs ${
+                                    cnt > 0 ? 'bg-amber-300/90' : 'bg-zinc-700/35'
+                                  }`}
+                                />
+                              ))}
                         </div>
                       </div>
-                    </button>
-
-                    <div className="flex shrink-0 items-center gap-1">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          onSelectChannel(ch.id);
-                          handleFitRollToChannel(ch);
-                          onChannelSoloToggle(ch.id);
-                        }}
-                        aria-pressed={ch.soloed}
-                        aria-label={
-                          ch.soloed ? `Stop hearing only ${ch.name}` : `Hear only ${ch.name}`
-                        }
-                        className={`h-7 rounded border px-2 text-[10px] font-bold transition-colors whitespace-nowrap ${
-                          ch.soloed
-                            ? 'border-amber-400 bg-amber-500 text-zinc-950'
-                            : 'border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-amber-500/50 hover:text-amber-300'
-                        }`}
-                      >
-                        {ch.soloed ? 'Only On' : 'Hear Only'}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => onChannelMuteToggle(ch.id)}
-                        aria-pressed={ch.muted}
-                        aria-label={`Mute ${ch.name}`}
-                        className={`h-7 w-7 rounded border font-mono-tabular text-[10px] font-bold transition-colors ${
-                          ch.muted
-                            ? 'border-rose-500/60 bg-rose-500/20 text-rose-300'
-                            : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200'
-                        }`}
-                      >
-                        M
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          if (isRowHumming) {
-                            stopHumCapture();
-                          }
-                          onRemoveChannel(ch.id);
-                        }}
-                        aria-label={`Delete ${ch.name}`}
-                        title={`Delete ${ch.name}`}
-                        className="flex h-7 w-7 items-center justify-center rounded border border-zinc-800 bg-zinc-900 text-zinc-400 transition-colors hover:border-rose-500/40 hover:text-rose-300"
-                      >
-                        <Trash2 className="h-3 w-3" />
-                      </button>
                     </div>
                   </div>
 
-                  {/* Row Actions: Hum to Row, Play Hum, Voice Selector, Browse API Voices, Volume */}
-                  <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (isRowHumming) {
-                          stopHumCapture();
-                        } else {
-                          void startHumCaptureForChannel(ch);
-                        }
-                      }}
-                      aria-label={
-                        isRowHumming
-                          ? `Stop hum recording on ${ch.name}`
-                          : `Hum to ${ch.name}`
-                      }
-                      className={`flex h-7 items-center gap-1 rounded-md px-2.5 text-[11px] font-bold transition-colors whitespace-nowrap ${
-                        isRowHumming
-                          ? 'bg-rose-500 text-white hover:bg-rose-400'
-                          : 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
-                      }`}
-                    >
-                      {isRowHumming ? (
-                        <>
-                          <MicOff className="h-3 w-3" />
-                          <span>
-                            Stop Hum
-                            {liveHumMidi !== null ? ` (${midiToNoteName(liveHumMidi)})` : ''}
-                          </span>
-                        </>
-                      ) : (
-                        <>
-                          <Mic className="h-3 w-3" />
-                          <span>Hum to Row</span>
-                        </>
-                      )}
-                    </button>
+                  {/* ROWS 02..N: Melodic / Hum Stem Tracks */}
+                  {stemChannels.map((ch, idx) => {
+                    const rowNumber = String(idx + 2).padStart(2, '0');
+                    const accent = CHANNEL_ACCENT[ch.color];
+                    const isSelected =
+                      effectiveInspectorMode === 'channel' && selectedChannel?.id === ch.id;
+                    const isRowHumming = hummingChannelId === ch.id;
+                    const channelOffKeyCount = ch.notes.filter(
+                      (n) => !isMidiInScale(n.midi, rootKey, scaleType)
+                    ).length;
 
-                    {ch.hasHumAudio && (
+                    const voiceShortLabel =
+                      ch.voiceMode === 'hum_audio' && ch.hasHumAudio
+                        ? 'Raw Hum Audio'
+                        : ch.voiceMode === 'custom_sample' && ch.customVoiceSample
+                        ? ch.customVoiceSample.name
+                        : KEYBOARD_SOUND_PRESETS.find((p) => p.id === ch.soundId)
+                            ?.shortLabel ?? 'Synth';
+
+                    const channelMaxStep = ch.notes.reduce(
+                      (max, n) => Math.max(max, n.step + n.durationSteps),
+                      loopBars * 16
+                    );
+                    const clipBarsSpan = Math.min(
+                      timelineBars,
+                      Math.max(loopBars, Math.ceil(channelMaxStep / 16))
+                    );
+                    const clipSpanSteps = clipBarsSpan * 16;
+                    const humPeaks = humPeaksByChannel[ch.id] ?? [];
+
+                    return (
+                      <div
+                        key={ch.id}
+                        data-testid={`stem-row-${rowNumber}`}
+                        className="flex h-[62px] border-b border-[#2C3643] last:border-b-0"
+                      >
+                        {/* FL Track Header Block */}
+                        <div
+                          className={`sticky left-0 z-10 flex w-[156px] shrink-0 items-center justify-between gap-1 border-r border-[#2F3A47] px-2 py-1.5 transition-colors sm:w-[220px] sm:gap-1.5 sm:px-2.5 ${
+                            isSelected ? accent.flHeaderSelected : accent.flHeader
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setInspectorTarget('channel');
+                              onSelectChannel(ch.id);
+                              handleFitRollToChannel(ch);
+                            }}
+                            className="min-w-0 flex-1 text-left focus:outline-none"
+                          >
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-mono-tabular text-[10px] font-bold opacity-75">
+                                {rowNumber}
+                              </span>
+                              <span className="truncate text-xs font-bold">
+                                {ch.name.replace(/^Row \d+\s*·\s*/, '')}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1 truncate font-mono-tabular text-[10px] opacity-85">
+                              <span className="truncate">{voiceShortLabel}</span>
+                              {channelOffKeyCount > 0 && (
+                                <span className="rounded bg-rose-600 px-1 text-[9px] font-bold text-white">
+                                  {channelOffKeyCount}!
+                                </span>
+                              )}
+                            </div>
+                          </button>
+
+                          <div className="flex shrink-0 items-center gap-1">
+                            {/* Quick Direct Mic Hum Button right on Track Header */}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setInspectorTarget('channel');
+                                if (isRowHumming) {
+                                  stopHumCapture();
+                                } else {
+                                  void startHumCaptureForChannel(ch);
+                                }
+                              }}
+                              aria-label={
+                                isRowHumming
+                                  ? `Stop hum recording on ${ch.name}`
+                                  : `Hum to ${ch.name}`
+                              }
+                              title={isRowHumming ? 'Stop Hum' : 'Hum to Row'}
+                              className={`flex h-6 w-6 items-center justify-center rounded transition-colors ${
+                                isRowHumming
+                                  ? 'bg-rose-500 text-white shadow-sm'
+                                  : 'bg-black/25 text-zinc-100 hover:bg-amber-500 hover:text-zinc-950'
+                              }`}
+                            >
+                              {isRowHumming ? (
+                                <MicOff className="h-3 w-3" />
+                              ) : (
+                                <Mic className="h-3 w-3" />
+                              )}
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setInspectorTarget('channel');
+                                onSelectChannel(ch.id);
+                                handleFitRollToChannel(ch);
+                                onChannelSoloToggle(ch.id);
+                              }}
+                              aria-pressed={ch.soloed}
+                              aria-label={
+                                ch.soloed
+                                  ? `Stop hearing only ${ch.name}`
+                                  : `Hear only ${ch.name}`
+                              }
+                              title="Solo track"
+                              className={`rounded px-1.5 py-0.5 text-[9px] font-bold transition-colors ${
+                                ch.soloed
+                                  ? 'bg-amber-400 text-zinc-950'
+                                  : 'bg-black/25 text-zinc-100 hover:bg-black/45'
+                              }`}
+                            >
+                              S
+                            </button>
+
+                            <button
+                              type="button"
+                              onClick={() => onChannelMuteToggle(ch.id)}
+                              aria-pressed={ch.muted}
+                              aria-label={`Mute ${ch.name}`}
+                              title={ch.muted ? 'Unmute track' : 'Mute track'}
+                              className="flex h-5 w-5 items-center justify-center rounded bg-black/25 hover:bg-black/45"
+                            >
+                              <span
+                                className={`h-2.5 w-2.5 rounded-full transition-colors ${
+                                  ch.muted
+                                    ? 'bg-zinc-600'
+                                    : 'bg-[#8CE94A] shadow-[0_0_6px_rgba(140,233,74,0.75)]'
+                                }`}
+                              />
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Timeline Clip Lane */}
+                        <div className="relative flex-1 bg-[#232B34]">
+                          {/* Bar + 4-Beat Gridlines */}
+                          <div
+                            className="pointer-events-none absolute inset-0 grid"
+                            style={{
+                              gridTemplateColumns: `repeat(${timelineBars}, minmax(0, 1fr))`,
+                            }}
+                          >
+                            {Array.from({ length: timelineBars }).map((_, b) => (
+                              <div
+                                key={b}
+                                onClick={() => {
+                                  setInspectorTarget('channel');
+                                  onSelectChannel(ch.id);
+                                  handleFitRollToChannel(ch);
+                                  if (b < loopBars) onSelectBar(b);
+                                }}
+                                className={`pointer-events-auto grid cursor-pointer grid-cols-4 border-r border-[#333F4D] ${
+                                  b % 2 === 1 ? 'bg-black/10' : ''
+                                }`}
+                              >
+                                <span className="border-r border-white/[0.04]" />
+                                <span className="border-r border-white/[0.04]" />
+                                <span className="border-r border-white/[0.04]" />
+                                <span />
+                              </div>
+                            ))}
+                          </div>
+
+                          {/* FL-Style Pattern / Hum Audio Clip */}
+                          <div
+                            onClick={(e) => {
+                              const rect = e.currentTarget.getBoundingClientRect();
+                              const rel = Math.max(0, Math.min(0.99, (e.clientX - rect.left) / rect.width));
+                              const clickedBar = Math.min(loopBars - 1, Math.floor(rel * clipBarsSpan));
+                              setInspectorTarget('channel');
+                              onSelectChannel(ch.id);
+                              handleFitRollToChannel(ch);
+                              onSelectBar(clickedBar);
+                            }}
+                            style={{
+                              left: '0%',
+                              width: `${(clipBarsSpan / timelineBars) * 100}%`,
+                            }}
+                            className={`absolute inset-y-1 flex cursor-pointer flex-col overflow-hidden rounded-sm border transition-all ${
+                              ch.muted
+                                ? 'border-zinc-600/70 opacity-45'
+                                : isSelected
+                                ? 'border-amber-300/90 shadow-md'
+                                : 'border-white/20 hover:border-white/40'
+                            }`}
+                          >
+                            {/* Clip Header Bar */}
+                            <div
+                              className={`flex h-4 shrink-0 items-center justify-between px-2 text-[10px] font-bold text-white ${
+                                ch.voiceMode === 'hum_audio' && ch.hasHumAudio
+                                  ? 'bg-[#A13B4A]'
+                                  : accent.flClipBar
+                              }`}
+                            >
+                              <span className="truncate">
+                                {ch.name.replace(/^Row \d+\s*·\s*/, '')} · {voiceShortLabel}
+                              </span>
+                              <span className="font-mono-tabular text-[9px] opacity-85">
+                                {ch.notes.length > 0 ? `${ch.notes.length} notes` : 'Empty'}
+                              </span>
+                            </div>
+
+                            {/* Clip Body: Vocal Audio Waveform OR MIDI Note Bars */}
+                            <div className="relative flex flex-1 items-center gap-px overflow-hidden bg-[#151C24]/90 px-1">
+                              {ch.voiceMode === 'hum_audio' &&
+                              ch.hasHumAudio &&
+                              humPeaks.length > 0 ? (
+                                humPeaks.map((pk, pIdx) => (
+                                  <div
+                                    key={pIdx}
+                                    style={{
+                                      height: `${Math.max(16, Math.round(pk * 92))}%`,
+                                    }}
+                                    className="flex-1 rounded-xs bg-rose-200/90"
+                                  />
+                                ))
+                              ) : (
+                                ch.notes.map((note, nIdx) => {
+                                  const leftPct = (note.step / clipSpanSteps) * 100;
+                                  const widthPct = Math.max(
+                                    1.2,
+                                    (note.durationSteps / clipSpanSteps) * 100
+                                  );
+                                  const yPct = Math.max(
+                                    8,
+                                    Math.min(82, ((84 - note.midi) / 48) * 74 + 8)
+                                  );
+                                  const inKey = isMidiInScale(note.midi, rootKey, scaleType);
+                                  return (
+                                    <span
+                                      key={`${note.step}-${note.midi}-${nIdx}`}
+                                      style={{
+                                        left: `${leftPct}%`,
+                                        width: `${widthPct}%`,
+                                        top: `${yPct}%`,
+                                      }}
+                                      className={`pointer-events-none absolute h-[3px] rounded-xs ${
+                                        !inKey ? 'bg-rose-400' : accent.flNoteFill
+                                      }`}
+                                    />
+                                  );
+                                })
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* ACTIVE TRACK CONSOLE INSPECTOR BAR (Clean, Uncluttered Controls for Selected Track) */}
+      <section
+        aria-label="Selected Track Inspector"
+        className="rounded-xl border border-[#2F3A47] bg-[#171D24] px-3 py-2.5 sm:px-4"
+      >
+        {effectiveInspectorMode === 'loop' ? (
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-mono-tabular rounded bg-[#365C7C] px-2 py-0.5 text-[10px] font-bold text-white">
+                TRACK 01
+              </span>
+              <span className="text-xs font-bold text-zinc-100">
+                Loop Bed Source
+              </span>
+
+              <div
+                role="group"
+                aria-label="Row 1 loop source"
+                className="flex items-center gap-0.5 rounded-md border border-[#34404E] bg-[#11161C] p-0.5"
+              >
+                <button
+                  type="button"
+                  onClick={() => onSelectLoopSource('sequencer')}
+                  aria-pressed={stemLoopSource === 'sequencer'}
+                  className={`rounded px-2.5 py-1 text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                    stemLoopSource === 'sequencer'
+                      ? 'bg-amber-500 text-zinc-950'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  Sequencer
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onSelectLoopSource('taploop')}
+                  aria-pressed={stemLoopSource === 'taploop'}
+                  className={`rounded px-2.5 py-1 text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                    stemLoopSource === 'taploop'
+                      ? 'bg-emerald-500 text-zinc-950'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  Tap Loop
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (phoneLoopFileName) {
+                      onSelectLoopSource('phone_audio');
+                    } else {
+                      phoneFileInputRef.current?.click();
+                    }
+                  }}
+                  aria-pressed={stemLoopSource === 'phone_audio'}
+                  className={`rounded px-2.5 py-1 text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                    stemLoopSource === 'phone_audio'
+                      ? 'bg-sky-400 text-zinc-950'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  Phone Loop
+                </button>
+              </div>
+
+              <button
+                type="button"
+                disabled={isUploadingPhoneLoop}
+                onClick={() => phoneFileInputRef.current?.click()}
+                className="flex h-7 items-center gap-1 rounded-md border border-[#3C4958] bg-[#1E252E] px-2.5 text-[11px] font-semibold text-zinc-100 hover:border-sky-400/60 hover:text-sky-300 disabled:opacity-60 whitespace-nowrap"
+              >
+                <Upload className="h-3 w-3" />
+                <span>
+                  {isUploadingPhoneLoop
+                    ? 'Loading...'
+                    : phoneLoopFileName
+                    ? 'Replace Phone Audio'
+                    : 'Upload Phone Audio'}
+                </span>
+              </button>
+
+              {phoneLoopFileName && (
+                <button
+                  type="button"
+                  onClick={onClearPhoneLoopFile}
+                  aria-label="Remove phone loop"
+                  className="flex h-7 w-7 items-center justify-center rounded-md border border-[#34404E] bg-[#13181E] text-zinc-400 hover:border-rose-500/40 hover:text-rose-300"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onToggleLoopSolo}
+                aria-pressed={stemLoopSoloed}
+                className={`h-7 rounded-md border px-2.5 text-[11px] font-bold transition-colors whitespace-nowrap ${
+                  stemLoopSoloed
+                    ? 'border-amber-400 bg-amber-500 text-zinc-950'
+                    : 'border-[#34404E] bg-[#13181E] text-zinc-300 hover:text-white'
+                }`}
+              >
+                {stemLoopSoloed ? 'Hear Only: On' : 'Hear Only'}
+              </button>
+              <button
+                type="button"
+                onClick={onToggleLoopMuted}
+                aria-pressed={stemLoopMuted}
+                className={`flex h-7 items-center gap-1 rounded-md border px-2.5 text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                  stemLoopMuted
+                    ? 'border-rose-500/50 bg-rose-500/15 text-rose-300'
+                    : 'border-[#34404E] bg-[#13181E] text-zinc-300'
+                }`}
+              >
+                {stemLoopMuted ? <VolumeX className="h-3.5 w-3.5" /> : <Volume2 className="h-3.5 w-3.5" />}
+                <span>{stemLoopMuted ? 'Muted' : 'Active'}</span>
+              </button>
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="range"
+                  min={-60}
+                  max={6}
+                  step={0.5}
+                  value={stemLoopVolumeDb}
+                  onChange={(e) => onLoopVolumeChange(Number(e.target.value))}
+                  aria-label="Row 1 loop volume"
+                  className="studio-slider w-20"
+                />
+                <span className="font-mono-tabular w-11 text-right text-[11px] text-zinc-400">
+                  {formatVolumeDb(stemLoopVolumeDb)}
+                </span>
+              </div>
+            </div>
+          </div>
+        ) : selectedChannel ? (
+          (() => {
+            const isRowHumming = hummingChannelId === selectedChannel.id;
+            const isRowPlayingHum = playingHumChannelId === selectedChannel.id;
+            const rowIndex = stemChannels.findIndex((c) => c.id === selectedChannel.id) + 2;
+            const accent = CHANNEL_ACCENT[selectedChannel.color];
+
+            return (
+              <div className="flex flex-wrap items-center justify-between gap-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span
+                    className={`font-mono-tabular rounded px-2 py-0.5 text-[10px] font-bold text-white ${accent.flClipBar}`}
+                  >
+                    TRACK {String(rowIndex).padStart(2, '0')}
+                  </span>
+                  <span className="text-xs font-bold text-zinc-100">
+                    {selectedChannel.name.replace(/^Row \d+\s*·\s*/, '')}
+                  </span>
+
+                  {/* Hum to Row */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (isRowHumming) {
+                        stopHumCapture();
+                      } else {
+                        void startHumCaptureForChannel(selectedChannel);
+                      }
+                    }}
+                    aria-label={
+                      isRowHumming
+                        ? `Stop hum recording on ${selectedChannel.name}`
+                        : `Hum to ${selectedChannel.name}`
+                    }
+                    className={`flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-bold transition-colors whitespace-nowrap ${
+                      isRowHumming
+                        ? 'bg-rose-500 text-white hover:bg-rose-400'
+                        : 'bg-amber-500 text-zinc-950 hover:bg-amber-400'
+                    }`}
+                  >
+                    {isRowHumming ? (
+                      <>
+                        <MicOff className="h-3.5 w-3.5" />
+                        <span>
+                          Stop Hum
+                          {liveHumMidi !== null ? ` (${midiToNoteName(liveHumMidi)})` : ''}
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <Mic className="h-3.5 w-3.5" />
+                        <span>Hum to Row</span>
+                      </>
+                    )}
+                  </button>
+
+                  {selectedChannel.hasHumAudio && (
+                    <>
                       <button
                         type="button"
-                        onClick={() => void handleTogglePlayHumPreview(ch.id)}
-                        className={`flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                        onClick={() => void handleTogglePlayHumPreview(selectedChannel.id)}
+                        className={`flex h-8 items-center gap-1 rounded-md border px-2.5 text-xs font-semibold transition-colors whitespace-nowrap ${
                           isRowPlayingHum
                             ? 'border-sky-400 bg-sky-400 text-zinc-950'
-                            : 'border-zinc-700 bg-zinc-900 text-sky-300 hover:border-sky-400/50'
+                            : 'border-[#34404E] bg-[#13181E] text-sky-300 hover:border-sky-400/50'
                         }`}
                       >
                         {isRowPlayingHum ? (
-                          <Square className="h-2.5 w-2.5 fill-current" />
+                          <Square className="h-3 w-3 fill-current" />
                         ) : (
-                          <Play className="h-2.5 w-2.5 fill-current" />
+                          <Play className="h-3 w-3 fill-current" />
                         )}
                         <span>{isRowPlayingHum ? 'Stop Hum' : 'Play Hum'}</span>
                       </button>
-                    )}
 
-                    <select
-                      aria-label={`Voice for ${ch.name}`}
-                      value={
-                        ch.voiceMode === 'custom_sample' ? '__custom__' : ch.soundId
-                      }
-                      onChange={(e) => {
-                        if (e.target.value !== '__custom__') {
-                          onChannelSoundChange(ch.id, e.target.value as KeyboardSoundId);
-                        }
-                      }}
-                      className="h-7 min-w-[115px] flex-1 rounded-md border border-zinc-800 bg-zinc-900 px-2 text-[11px] font-semibold text-zinc-100 focus:border-amber-500 focus:outline-none"
-                    >
-                      {KEYBOARD_SOUND_PRESETS.map((preset) => (
-                        <option key={preset.id} value={preset.id}>
-                          {preset.label}
-                        </option>
-                      ))}
-                      {ch.customVoiceSample && (
-                        <option value="__custom__">
-                          API: {ch.customVoiceSample.name}
-                        </option>
-                      )}
-                    </select>
-
-                    <button
-                      type="button"
-                      onClick={() => setVoiceBrowserChannelId(ch.id)}
-                      aria-label={`Browse voices and API sounds for ${ch.name}`}
-                      className="flex h-7 items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-2 text-[11px] font-semibold text-zinc-200 hover:border-emerald-500/50 hover:text-emerald-300 whitespace-nowrap"
-                    >
-                      <Search className="h-3 w-3" />
-                      <span>Browse</span>
-                    </button>
-
-                    <div className="flex items-center gap-1">
-                      <Volume2 className="h-3 w-3 shrink-0 text-zinc-400" />
-                      <input
-                        type="range"
-                        min={-60}
-                        max={6}
-                        step={0.5}
-                        value={ch.volume_db}
-                        onChange={(e) =>
-                          onChannelVolumeChange(ch.id, Number(e.target.value))
-                        }
-                        aria-label={`${ch.name} volume`}
-                        className="studio-slider w-14 sm:w-16"
-                      />
-                      <span className="font-mono-tabular w-11 text-right text-[10px] text-zinc-400">
-                        {formatVolumeDb(ch.volume_db)}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Hum Audio vs Keyboard/Synth Voice Mode Switch (appears once hummed) */}
-                  {ch.hasHumAudio && (
-                    <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-zinc-800/80 bg-zinc-900/60 px-2 py-1">
-                      <span className="text-[10px] font-medium text-zinc-400">
-                        Row Voice Mode:
-                      </span>
-                      <div className="flex items-center gap-1">
+                      <div className="flex h-8 items-center rounded-md border border-[#34404E] bg-[#11161C] p-0.5">
                         <button
                           type="button"
-                          onClick={() => onChannelVoiceModeChange(ch.id, 'hum_audio')}
-                          className={`rounded px-2 py-0.5 text-[10px] font-semibold whitespace-nowrap ${
-                            ch.voiceMode === 'hum_audio'
+                          onClick={() =>
+                            onChannelVoiceModeChange(selectedChannel.id, 'hum_audio')
+                          }
+                          className={`h-7 rounded px-2 text-[11px] font-semibold whitespace-nowrap ${
+                            selectedChannel.voiceMode === 'hum_audio'
                               ? 'bg-sky-400 text-zinc-950'
                               : 'text-zinc-400 hover:text-zinc-200'
                           }`}
@@ -1597,457 +2021,500 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
                           type="button"
                           onClick={() =>
                             onChannelVoiceModeChange(
-                              ch.id,
-                              ch.customVoiceSample ? 'custom_sample' : 'keyboard'
+                              selectedChannel.id,
+                              selectedChannel.customVoiceSample
+                                ? 'custom_sample'
+                                : 'keyboard'
                             )
                           }
-                          className={`rounded px-2 py-0.5 text-[10px] font-semibold whitespace-nowrap ${
-                            ch.voiceMode !== 'hum_audio'
+                          className={`h-7 rounded px-2 text-[11px] font-semibold whitespace-nowrap ${
+                            selectedChannel.voiceMode !== 'hum_audio'
                               ? 'bg-amber-500 text-zinc-950'
                               : 'text-zinc-400 hover:text-zinc-200'
                           }`}
                         >
-                          {ch.voiceMode === 'custom_sample' && ch.customVoiceSample
-                            ? ch.customVoiceSample.name
-                            : KEYBOARD_SOUND_PRESETS.find((p) => p.id === ch.soundId)
-                                ?.shortLabel ?? 'Synth / Keys'}
+                          Synth / Keys
                         </button>
                       </div>
-                    </div>
+                    </>
                   )}
 
-                  {/* Full 64-step Mini Sequence Overview */}
-                  <div
-                    aria-label={`${ch.name} 64-step sequence`}
-                    className="relative mt-2.5 h-10 w-full overflow-hidden rounded border border-zinc-800/80 bg-zinc-950"
+                  {/* Built-in Keyboard Voice Picker */}
+                  <select
+                    aria-label={`Voice for ${selectedChannel.name}`}
+                    value={
+                      selectedChannel.voiceMode === 'custom_sample'
+                        ? '__custom__'
+                        : selectedChannel.soundId
+                    }
+                    onChange={(e) => {
+                      if (e.target.value !== '__custom__') {
+                        onChannelSoundChange(
+                          selectedChannel.id,
+                          e.target.value as KeyboardSoundId
+                        );
+                      }
+                    }}
+                    className="h-8 min-w-[140px] rounded-md border border-[#34404E] bg-[#13181E] px-2.5 text-xs font-semibold text-zinc-100 focus:border-amber-500 focus:outline-none"
                   >
-                    {[1, 2, 3].map((b) => (
-                      <div
-                        key={b}
-                        style={{ left: `${(b / 4) * 100}%` }}
-                        className="pointer-events-none absolute inset-y-0 w-px bg-zinc-800"
-                      />
+                    {KEYBOARD_SOUND_PRESETS.map((preset) => (
+                      <option key={preset.id} value={preset.id}>
+                        {preset.label}
+                      </option>
                     ))}
-
-                    <div
-                      style={{
-                        left: `${(barOffset / 4) * 100}%`,
-                        width: '25%',
-                      }}
-                      className="pointer-events-none absolute inset-y-0 border-x border-amber-500/30 bg-amber-500/5"
-                    />
-
-                    {loopBars < 4 && (
-                      <div
-                        style={{
-                          left: `${(loopBars / 4) * 100}%`,
-                          width: `${((4 - loopBars) / 4) * 100}%`,
-                        }}
-                        className="pointer-events-none absolute inset-y-0 bg-zinc-950/75"
-                      />
+                    {selectedChannel.customVoiceSample && (
+                      <option value="__custom__">
+                        API: {selectedChannel.customVoiceSample.name}
+                      </option>
                     )}
+                  </select>
 
-                    {ch.notes.map((note, nIdx) => {
-                      const leftPct = (note.step / 64) * 100;
-                      const widthPct = Math.max(1.5, (note.durationSteps / 64) * 100);
-                      const yPct = Math.max(
-                        8,
-                        Math.min(82, ((84 - note.midi) / 48) * 76 + 8)
-                      );
-                      const inKey = isMidiInScale(note.midi, rootKey, scaleType);
-                      return (
-                        <span
-                          key={`${note.step}-${note.midi}-${nIdx}`}
-                          style={{
-                            left: `${leftPct}%`,
-                            width: `${widthPct}%`,
-                            top: `${yPct}%`,
-                          }}
-                          className={`pointer-events-none absolute h-1.5 rounded-xs ${
-                            !inKey
-                              ? 'bg-rose-400'
-                              : ch.muted
-                              ? 'bg-zinc-600'
-                              : accent.dot
-                          }`}
-                        />
-                      );
-                    })}
-
-                    {isPlaying && currentStep >= 0 && (
-                      <div
-                        style={{ left: `${(currentStep / 64) * 100}%` }}
-                        className="pointer-events-none absolute inset-y-0 w-0.5 bg-amber-400"
-                      />
-                    )}
-                  </div>
+                  {/* Browse Freesound & Secondary API Voices */}
+                  <button
+                    type="button"
+                    onClick={() => setVoiceBrowserChannelId(selectedChannel.id)}
+                    aria-label={`Browse voices and API sounds for ${selectedChannel.name}`}
+                    className="flex h-8 items-center gap-1.5 rounded-md border border-[#3C4958] bg-[#1E252E] px-2.5 text-xs font-semibold text-zinc-100 hover:border-emerald-500/50 hover:text-emerald-300 whitespace-nowrap"
+                  >
+                    <Search className="h-3.5 w-3.5" />
+                    <span>Browse Voices</span>
+                  </button>
                 </div>
-              );
-            })}
-          </div>
-        </section>
 
-        {/* RIGHT PANE: Interactive Piano Roll + Docked Keyboard Row */}
-        {selectedChannel ? (
-          <div
-            className={`space-y-3.5 lg:col-span-7 ${
-              mobilePane === 'pianoroll' ? 'block' : 'hidden lg:block'
-            }`}
-          >
-            <section
-              aria-label="Piano Roll Sequence Editor"
-              className="rounded-xl border border-zinc-800 bg-[#111114] p-3.5 sm:p-4"
-            >
-              {/* Piano Roll Header Controls */}
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                {/* Right Controls: Solo / Mute / Volume / Delete */}
                 <div className="flex flex-wrap items-center gap-2">
-                  <span
-                    className={`h-2.5 w-2.5 rounded-full ${
-                      CHANNEL_ACCENT[selectedChannel.color].dot
-                    }`}
-                  />
-                  <h2 className="text-xs font-bold tracking-wide text-zinc-100 uppercase">
-                    Piano Roll · {selectedChannel.name}
-                  </h2>
-                  <span className="text-xs text-zinc-400">
-                    · {activeVoiceDisplayLabel}
-                  </span>
-                  {selectedChannel.hasHumAudio && (
-                    <button
-                      type="button"
-                      onClick={() => onClearHumAudio(selectedChannel.id)}
-                      className="rounded border border-zinc-800 bg-zinc-950 px-2 py-0.5 text-[10px] font-semibold text-zinc-400 hover:border-rose-500/40 hover:text-rose-300"
-                    >
-                      Clear Hum
-                    </button>
-                  )}
-                </div>
-
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <div
-                    role="group"
-                    aria-label="Piano Roll bar selector"
-                    className="flex items-center gap-0.5 rounded-lg border border-zinc-800 bg-zinc-950 p-0.5"
-                  >
-                    {Array.from({ length: loopBars }).map((_, idx) => (
-                      <button
-                        key={idx}
-                        type="button"
-                        onClick={() => onSelectBar(idx)}
-                        className={`rounded px-2 py-1 font-mono-tabular text-[11px] font-semibold ${
-                          barOffset === idx
-                            ? 'bg-amber-500 text-zinc-950'
-                            : 'text-zinc-400 hover:text-zinc-200'
-                        }`}
-                      >
-                        B{idx + 1}
-                      </button>
-                    ))}
-                  </div>
-
                   <button
                     type="button"
-                    onClick={onToggleFollowPlayhead}
-                    aria-pressed={followPlayhead}
-                    className={`h-7 rounded-md border px-2 text-[11px] font-semibold transition-colors whitespace-nowrap ${
-                      followPlayhead
-                        ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300'
-                        : 'border-zinc-800 bg-zinc-950 text-zinc-400'
+                    onClick={() => onChannelSoloToggle(selectedChannel.id)}
+                    aria-pressed={selectedChannel.soloed}
+                    className={`h-8 rounded-md border px-2.5 text-xs font-bold transition-colors whitespace-nowrap ${
+                      selectedChannel.soloed
+                        ? 'border-amber-400 bg-amber-500 text-zinc-950'
+                        : 'border-[#34404E] bg-[#13181E] text-zinc-300 hover:text-white'
                     }`}
                   >
-                    Follow
-                  </button>
-
-                  <div className="flex items-center gap-0.5 rounded-lg border border-zinc-800 bg-zinc-950 p-0.5">
-                    {[
-                      { steps: 1, label: '1/16' },
-                      { steps: 2, label: '1/8' },
-                      { steps: 4, label: '1/4' },
-                    ].map((opt) => (
-                      <button
-                        key={opt.steps}
-                        type="button"
-                        onClick={() => setNoteDurationSteps(opt.steps)}
-                        className={`rounded px-1.5 py-1 font-mono-tabular text-[10px] font-semibold ${
-                          noteDurationSteps === opt.steps
-                            ? 'bg-zinc-800 text-amber-300'
-                            : 'text-zinc-500 hover:text-zinc-300'
-                        }`}
-                      >
-                        {opt.label}
-                      </button>
-                    ))}
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() => setShowGhostNotes((v) => !v)}
-                    aria-pressed={showGhostNotes}
-                    className={`h-7 rounded-md border px-2 text-[11px] font-semibold whitespace-nowrap ${
-                      showGhostNotes
-                        ? 'border-sky-500/45 bg-sky-500/15 text-sky-300'
-                        : 'border-zinc-800 bg-zinc-950 text-zinc-400'
-                    }`}
-                  >
-                    Ghost
+                    {selectedChannel.soloed ? 'Hear Only: On' : 'Hear Only'}
                   </button>
 
                   <button
                     type="button"
-                    onClick={() => handleFitRollToChannel(selectedChannel)}
-                    className="flex h-7 items-center gap-1 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-[11px] font-semibold text-zinc-300 hover:text-white whitespace-nowrap"
-                    title="Center Piano Roll on this row's notes"
+                    onClick={() => onChannelMuteToggle(selectedChannel.id)}
+                    aria-pressed={selectedChannel.muted}
+                    className={`h-8 rounded-md border px-2.5 text-xs font-bold transition-colors ${
+                      selectedChannel.muted
+                        ? 'border-rose-500/60 bg-rose-500/20 text-rose-300'
+                        : 'border-[#34404E] bg-[#13181E] text-zinc-300'
+                    }`}
                   >
-                    <Sparkles className="h-3 w-3 text-amber-400" />
-                    <span>Fit</span>
+                    {selectedChannel.muted ? 'Muted' : 'Mute'}
                   </button>
 
-                  <div className="flex items-center rounded-md border border-zinc-800 bg-zinc-950 p-0.5">
-                    <button
-                      type="button"
-                      onClick={() => setRollTopMidi((m) => clampMidi(m - 4))}
-                      aria-label="Scroll Piano Roll down"
-                      className="flex h-6 w-6 items-center justify-center rounded text-zinc-300 hover:bg-zinc-800"
-                    >
-                      <ChevronDown className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setRollTopMidi((m) => clampMidi(m + 4))}
-                      aria-label="Scroll Piano Roll up"
-                      className="flex h-6 w-6 items-center justify-center rounded text-zinc-300 hover:bg-zinc-800"
-                    >
-                      <ChevronUp className="h-3.5 w-3.5" />
-                    </button>
+                  <div className="flex items-center gap-1.5">
+                    <Volume2 className="h-3.5 w-3.5 text-zinc-400" />
+                    <input
+                      type="range"
+                      min={-60}
+                      max={6}
+                      step={0.5}
+                      value={selectedChannel.volume_db}
+                      onChange={(e) =>
+                        onChannelVolumeChange(selectedChannel.id, Number(e.target.value))
+                      }
+                      aria-label={`${selectedChannel.name} volume`}
+                      className="studio-slider w-20"
+                    />
+                    <span className="font-mono-tabular w-11 text-right text-[11px] text-zinc-400">
+                      {formatVolumeDb(selectedChannel.volume_db)}
+                    </span>
                   </div>
 
                   <button
                     type="button"
-                    onClick={() => onClearChannelNotes(selectedChannel.id)}
-                    className="h-7 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-[11px] font-semibold text-zinc-400 hover:border-rose-500/40 hover:text-rose-300 whitespace-nowrap"
+                    onClick={() => {
+                      if (isRowHumming) stopHumCapture();
+                      onRemoveChannel(selectedChannel.id);
+                    }}
+                    aria-label={`Delete ${selectedChannel.name}`}
+                    title={`Delete ${selectedChannel.name}`}
+                    className="flex h-8 w-8 items-center justify-center rounded-md border border-[#34404E] bg-[#13181E] text-zinc-400 transition-colors hover:border-rose-500/40 hover:text-rose-300"
                   >
-                    Clear
+                    <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 </div>
               </div>
+            );
+          })()
+        ) : null}
+      </section>
 
-              {/* Piano Roll Grid */}
-              <div className="overflow-x-auto rounded-lg border border-zinc-800 bg-zinc-950">
-                <div className="min-w-[520px]">
-                  <div className="grid grid-cols-[58px_1fr] border-b border-zinc-800 bg-[#0D0D10]">
-                    <div className="flex items-center justify-center border-r border-zinc-800 px-1 py-1 font-mono-tabular text-[10px] font-semibold text-zinc-500">
-                      PITCH
+      {/* SECTION 2: LOWER DOCKED PIANO ROLL + 2-OCTAVE KEYBOARD ROW */}
+      {(desktopViewMode !== 'playlist' || mobilePane === 'pianoroll') && (
+        <div
+          className={`space-y-3 ${
+            mobilePane === 'pianoroll' ? 'block' : 'hidden'
+          } ${desktopViewMode === 'playlist' ? 'lg:hidden' : 'lg:block'}`}
+        >
+          {selectedChannel ? (
+            <>
+              <section
+                aria-label="Piano Roll Sequence Editor"
+                className="rounded-xl border border-[#2F3A47] bg-[#161C24] p-3 sm:p-4"
+              >
+                {/* Piano Roll Header Controls */}
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span
+                      className={`h-2.5 w-2.5 rounded-full ${
+                        CHANNEL_ACCENT[selectedChannel.color].dot
+                      }`}
+                    />
+                    <h2 className="text-xs font-bold tracking-wide text-zinc-100 uppercase">
+                      Piano Roll · {selectedChannel.name}
+                    </h2>
+                    <span className="text-xs text-zinc-400">
+                      · {activeVoiceDisplayLabel}
+                    </span>
+                    {selectedChannel.hasHumAudio && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setHumPeaksByChannel((prev) => {
+                            const next = { ...prev };
+                            delete next[selectedChannel.id];
+                            return next;
+                          });
+                          onClearHumAudio(selectedChannel.id);
+                        }}
+                        className="rounded border border-[#34404E] bg-[#11161C] px-2 py-0.5 text-[10px] font-semibold text-zinc-400 hover:border-rose-500/40 hover:text-rose-300"
+                      >
+                        Clear Hum
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <div
+                      role="group"
+                      aria-label="Piano Roll bar selector"
+                      className="flex items-center gap-0.5 rounded-md border border-[#34404E] bg-[#11161C] p-0.5"
+                    >
+                      {Array.from({ length: loopBars }).map((_, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          onClick={() => onSelectBar(idx)}
+                          className={`rounded px-2 py-1 font-mono-tabular text-[11px] font-semibold ${
+                            barOffset === idx
+                              ? 'bg-amber-500 text-zinc-950'
+                              : 'text-zinc-400 hover:text-zinc-200'
+                          }`}
+                        >
+                          B{idx + 1}
+                        </button>
+                      ))}
                     </div>
-                    <div className="grid grid-cols-16">
-                      {Array.from({ length: 16 }).map((_, col) => {
-                        const globalStep = barStartStep + col;
-                        const isActiveStep = isPlaying && currentStep === globalStep;
-                        const isBeatStart = col % 4 === 0;
+
+                    <button
+                      type="button"
+                      onClick={onToggleFollowPlayhead}
+                      aria-pressed={followPlayhead}
+                      className={`h-7 rounded-md border px-2 text-[11px] font-semibold transition-colors whitespace-nowrap ${
+                        followPlayhead
+                          ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300'
+                          : 'border-[#34404E] bg-[#11161C] text-zinc-400'
+                      }`}
+                    >
+                      Follow
+                    </button>
+
+                    <div className="flex items-center gap-0.5 rounded-md border border-[#34404E] bg-[#11161C] p-0.5">
+                      {[
+                        { steps: 1, label: '1/16' },
+                        { steps: 2, label: '1/8' },
+                        { steps: 4, label: '1/4' },
+                      ].map((opt) => (
+                        <button
+                          key={opt.steps}
+                          type="button"
+                          onClick={() => setNoteDurationSteps(opt.steps)}
+                          className={`rounded px-1.5 py-1 font-mono-tabular text-[10px] font-semibold ${
+                            noteDurationSteps === opt.steps
+                              ? 'bg-[#26303D] text-amber-300'
+                              : 'text-zinc-500 hover:text-zinc-300'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setShowGhostNotes((v) => !v)}
+                      aria-pressed={showGhostNotes}
+                      className={`h-7 rounded-md border px-2 text-[11px] font-semibold whitespace-nowrap ${
+                        showGhostNotes
+                          ? 'border-sky-500/45 bg-sky-500/15 text-sky-300'
+                          : 'border-[#34404E] bg-[#11161C] text-zinc-400'
+                      }`}
+                    >
+                      Ghost
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleFitRollToChannel(selectedChannel)}
+                      className="flex h-7 items-center gap-1 rounded-md border border-[#34404E] bg-[#11161C] px-2 text-[11px] font-semibold text-zinc-300 hover:text-white whitespace-nowrap"
+                      title="Center Piano Roll on this row's notes"
+                    >
+                      <Sparkles className="h-3 w-3 text-amber-400" />
+                      <span>Fit</span>
+                    </button>
+
+                    <div className="flex items-center rounded-md border border-[#34404E] bg-[#11161C] p-0.5">
+                      <button
+                        type="button"
+                        onClick={() => setRollTopMidi((m) => clampMidi(m - 4))}
+                        aria-label="Scroll Piano Roll down"
+                        className="flex h-6 w-6 items-center justify-center rounded text-zinc-300 hover:bg-[#242C36]"
+                      >
+                        <ChevronDown className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setRollTopMidi((m) => clampMidi(m + 4))}
+                        aria-label="Scroll Piano Roll up"
+                        className="flex h-6 w-6 items-center justify-center rounded text-zinc-300 hover:bg-[#242C36]"
+                      >
+                        <ChevronUp className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => onClearChannelNotes(selectedChannel.id)}
+                      className="h-7 rounded-md border border-[#34404E] bg-[#11161C] px-2 text-[11px] font-semibold text-zinc-400 hover:border-rose-500/40 hover:text-rose-300 whitespace-nowrap"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </div>
+
+                {/* Piano Roll Grid */}
+                <div className="overflow-x-auto rounded-lg border border-[#2F3A47] bg-[#131921]">
+                  <div className="min-w-[520px]">
+                    <div className="grid grid-cols-[58px_1fr] border-b border-[#2F3A47] bg-[#10151B]">
+                      <div className="flex items-center justify-center border-r border-[#2F3A47] px-1 py-1 font-mono-tabular text-[10px] font-semibold text-zinc-500">
+                        PITCH
+                      </div>
+                      <div className="grid grid-cols-16">
+                        {Array.from({ length: 16 }).map((_, col) => {
+                          const globalStep = barStartStep + col;
+                          const isActiveStep = isPlaying && currentStep === globalStep;
+                          const isBeatStart = col % 4 === 0;
+                          return (
+                            <div
+                              key={col}
+                              className={`border-r border-[#27313D] py-1 text-center font-mono-tabular text-[10px] ${
+                                isActiveStep
+                                  ? 'bg-amber-500 font-bold text-zinc-950'
+                                  : isBeatStart
+                                  ? 'font-bold text-zinc-200'
+                                  : 'text-zinc-500'
+                              }`}
+                            >
+                              {isBeatStart ? `${barOffset + 1}.${col / 4 + 1}` : '·'}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="divide-y divide-[#1E2630]">
+                      {visiblePitchMidis.map((midi) => {
+                        const noteName = midiToNoteName(midi);
+                        const isBlack = isBlackKeyMidi(midi);
+                        const inScale = isMidiInScale(midi, rootKey, scaleType);
+                        const isRoot = ((midi % 12) + 12) % 12 === rootPc;
+
+                        const rowNotes = selectedChannel.notes.filter(
+                          (n) =>
+                            n.midi === midi &&
+                            n.step >= barStartStep &&
+                            n.step < barStartStep + 16
+                        );
+
+                        const ghostRowNotes = showGhostNotes
+                          ? stemChannels
+                              .filter((other) => other.id !== selectedChannel.id && !other.muted)
+                              .flatMap((other) =>
+                                other.notes.filter(
+                                  (n) =>
+                                    n.midi === midi &&
+                                    n.step >= barStartStep &&
+                                    n.step < barStartStep + 16
+                                )
+                              )
+                          : [];
+
                         return (
-                          <div
-                            key={col}
-                            className={`border-r border-zinc-800/70 py-1 text-center font-mono-tabular text-[10px] ${
-                              isActiveStep
-                                ? 'bg-amber-500 font-bold text-zinc-950'
-                                : isBeatStart
-                                ? 'font-bold text-zinc-200'
-                                : 'text-zinc-500'
-                            }`}
-                          >
-                            {isBeatStart ? `${barOffset + 1}.${col / 4 + 1}` : '·'}
+                          <div key={midi} className="grid h-[21px] grid-cols-[58px_1fr]">
+                            <button
+                              type="button"
+                              onClick={() => onPlayKeyboardKey(midi, false)}
+                              className={`flex items-center justify-between border-r border-[#2F3A47] px-2 font-mono-tabular text-[10px] font-semibold transition-colors ${
+                                isBlack
+                                  ? 'bg-[#10151C] text-zinc-500 hover:bg-[#1A212B]'
+                                  : 'bg-[#1A222C] text-zinc-300 hover:bg-[#242F3D]'
+                              }`}
+                              title={`Audition ${noteName}`}
+                            >
+                              <span>{noteName}</span>
+                              {inScale && (
+                                <span
+                                  className={`h-1.5 w-1.5 rounded-full ${
+                                    isRoot ? 'bg-amber-400' : 'bg-emerald-500/70'
+                                  }`}
+                                />
+                              )}
+                            </button>
+
+                            <div className="relative grid grid-cols-16">
+                              {Array.from({ length: 16 }).map((_, col) => {
+                                const globalStep = barStartStep + col;
+                                const isBeatBorder = col % 4 === 0 && col > 0;
+                                const isPlayhead = isPlaying && currentStep === globalStep;
+                                return (
+                                  <button
+                                    key={col}
+                                    type="button"
+                                    aria-label={`Toggle ${noteName} at step ${globalStep + 1}`}
+                                    onClick={() =>
+                                      onToggleNote(
+                                        selectedChannel.id,
+                                        globalStep,
+                                        midi,
+                                        noteDurationSteps
+                                      )
+                                    }
+                                    className={`h-full border-r border-[#232C37] transition-colors hover:bg-amber-500/15 ${
+                                      isBeatBorder ? 'border-l border-l-[#344150]' : ''
+                                    } ${
+                                      isPlayhead
+                                        ? 'bg-amber-500/15'
+                                        : isBlack
+                                        ? 'bg-[#131921]'
+                                        : inScale
+                                        ? 'bg-[#19212B]'
+                                        : 'bg-[#141B23]'
+                                    }`}
+                                  />
+                                );
+                              })}
+
+                              {ghostRowNotes.map((gn, gIdx) => {
+                                const colOffset = gn.step - barStartStep;
+                                const spanCols = Math.min(16 - colOffset, gn.durationSteps);
+                                return (
+                                  <span
+                                    key={`ghost-${gn.step}-${gIdx}`}
+                                    style={{
+                                      left: `${(colOffset / 16) * 100}%`,
+                                      width: `${(spanCols / 16) * 100}%`,
+                                    }}
+                                    className="pointer-events-none absolute top-1 bottom-1 rounded border border-zinc-500/35 bg-zinc-500/20"
+                                  />
+                                );
+                              })}
+
+                              {rowNotes.map((note, nIdx) => {
+                                const colOffset = note.step - barStartStep;
+                                const spanCols = Math.min(16 - colOffset, note.durationSteps);
+                                const accent = CHANNEL_ACCENT[selectedChannel.color];
+                                return (
+                                  <button
+                                    key={`note-${note.step}-${nIdx}`}
+                                    type="button"
+                                    onClick={() =>
+                                      onToggleNote(
+                                        selectedChannel.id,
+                                        note.step,
+                                        note.midi,
+                                        note.durationSteps
+                                      )
+                                    }
+                                    style={{
+                                      left: `${(colOffset / 16) * 100}%`,
+                                      width: `${(spanCols / 16) * 100}%`,
+                                    }}
+                                    className={`absolute top-0.5 bottom-0.5 z-10 flex items-center justify-between rounded border px-1 font-mono-tabular text-[9px] font-bold shadow-sm ${
+                                      !inScale
+                                        ? 'border-rose-200 bg-rose-500 text-white'
+                                        : accent.noteBg
+                                    }`}
+                                    title={
+                                      !inScale
+                                        ? `${noteName} is off-key for ${rootKey} ${scaleType}. Click Fix Off-Key or tap to remove.`
+                                        : `${noteName} · Click to remove`
+                                    }
+                                  >
+                                    <span className="truncate">{noteName}</span>
+                                    {!inScale && <span>!</span>}
+                                  </button>
+                                );
+                              })}
+                            </div>
                           </div>
                         );
                       })}
                     </div>
                   </div>
-
-                  <div className="divide-y divide-zinc-900">
-                    {visiblePitchMidis.map((midi) => {
-                      const noteName = midiToNoteName(midi);
-                      const isBlack = isBlackKeyMidi(midi);
-                      const inScale = isMidiInScale(midi, rootKey, scaleType);
-                      const isRoot = ((midi % 12) + 12) % 12 === rootPc;
-
-                      const rowNotes = selectedChannel.notes.filter(
-                        (n) =>
-                          n.midi === midi &&
-                          n.step >= barStartStep &&
-                          n.step < barStartStep + 16
-                      );
-
-                      const ghostRowNotes = showGhostNotes
-                        ? stemChannels
-                            .filter((other) => other.id !== selectedChannel.id && !other.muted)
-                            .flatMap((other) =>
-                              other.notes.filter(
-                                (n) =>
-                                  n.midi === midi &&
-                                  n.step >= barStartStep &&
-                                  n.step < barStartStep + 16
-                              )
-                            )
-                        : [];
-
-                      return (
-                        <div key={midi} className="grid h-[21px] grid-cols-[58px_1fr]">
-                          <button
-                            type="button"
-                            onClick={() => onPlayKeyboardKey(midi, false)}
-                            className={`flex items-center justify-between border-r border-zinc-800 px-2 font-mono-tabular text-[10px] font-semibold transition-colors ${
-                              isBlack
-                                ? 'bg-zinc-950 text-zinc-500 hover:bg-zinc-900'
-                                : 'bg-zinc-900/75 text-zinc-300 hover:bg-zinc-800'
-                            }`}
-                            title={`Audition ${noteName}`}
-                          >
-                            <span>{noteName}</span>
-                            {inScale && (
-                              <span
-                                className={`h-1.5 w-1.5 rounded-full ${
-                                  isRoot ? 'bg-amber-400' : 'bg-emerald-500/70'
-                                }`}
-                              />
-                            )}
-                          </button>
-
-                          <div className="relative grid grid-cols-16">
-                            {Array.from({ length: 16 }).map((_, col) => {
-                              const globalStep = barStartStep + col;
-                              const isBeatBorder = col % 4 === 0 && col > 0;
-                              const isPlayhead = isPlaying && currentStep === globalStep;
-                              return (
-                                <button
-                                  key={col}
-                                  type="button"
-                                  aria-label={`Toggle ${noteName} at step ${globalStep + 1}`}
-                                  onClick={() =>
-                                    onToggleNote(
-                                      selectedChannel.id,
-                                      globalStep,
-                                      midi,
-                                      noteDurationSteps
-                                    )
-                                  }
-                                  className={`h-full border-r border-zinc-800/45 transition-colors hover:bg-amber-500/15 ${
-                                    isBeatBorder ? 'border-l border-l-zinc-700/80' : ''
-                                  } ${
-                                    isPlayhead
-                                      ? 'bg-amber-500/15'
-                                      : isBlack
-                                      ? 'bg-zinc-950/90'
-                                      : inScale
-                                      ? 'bg-zinc-900/40'
-                                      : 'bg-zinc-950/60'
-                                  }`}
-                                />
-                              );
-                            })}
-
-                            {ghostRowNotes.map((gn, gIdx) => {
-                              const colOffset = gn.step - barStartStep;
-                              const spanCols = Math.min(16 - colOffset, gn.durationSteps);
-                              return (
-                                <span
-                                  key={`ghost-${gn.step}-${gIdx}`}
-                                  style={{
-                                    left: `${(colOffset / 16) * 100}%`,
-                                    width: `${(spanCols / 16) * 100}%`,
-                                  }}
-                                  className="pointer-events-none absolute top-1 bottom-1 rounded border border-zinc-500/35 bg-zinc-500/20"
-                                />
-                              );
-                            })}
-
-                            {rowNotes.map((note, nIdx) => {
-                              const colOffset = note.step - barStartStep;
-                              const spanCols = Math.min(16 - colOffset, note.durationSteps);
-                              const accent = CHANNEL_ACCENT[selectedChannel.color];
-                              return (
-                                <button
-                                  key={`note-${note.step}-${nIdx}`}
-                                  type="button"
-                                  onClick={() =>
-                                    onToggleNote(
-                                      selectedChannel.id,
-                                      note.step,
-                                      note.midi,
-                                      note.durationSteps
-                                    )
-                                  }
-                                  style={{
-                                    left: `${(colOffset / 16) * 100}%`,
-                                    width: `${(spanCols / 16) * 100}%`,
-                                  }}
-                                  className={`absolute top-0.5 bottom-0.5 z-10 flex items-center justify-between rounded border px-1 font-mono-tabular text-[9px] font-bold shadow-sm ${
-                                    !inScale
-                                      ? 'border-rose-200 bg-rose-500 text-white'
-                                      : accent.noteBg
-                                  }`}
-                                  title={
-                                    !inScale
-                                      ? `${noteName} is off-key for ${rootKey} ${scaleType}. Click Fix Off-Key or tap to remove.`
-                                      : `${noteName} · Click to remove`
-                                  }
-                                >
-                                  <span className="truncate">{noteName}</span>
-                                  {!inScale && <span>!</span>}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
                 </div>
-              </div>
-            </section>
+              </section>
 
-            {/* Playable Piano Keyboard Row Docked Below Piano Roll */}
-            <PianoKeyboardRow
-              baseOctave={baseOctave}
-              onBaseOctaveChange={(oct) => {
-                setBaseOctave(oct);
-                setRollTopMidi(clampMidi((oct + 2) * 12 + 2));
-              }}
-              rootKey={rootKey}
-              scaleType={scaleType}
-              soundLabel={activeVoiceDisplayLabel}
-              punchInRecord={punchInRecord}
-              onTogglePunchIn={() => setPunchInRecord((v) => !v)}
-              activePlayingMidis={activePlayingMidis}
-              onPlayKey={(midi) => onPlayKeyboardKey(midi, punchInRecord)}
-            />
-          </div>
-        ) : (
-          <div
-            className={`lg:col-span-7 ${
-              mobilePane === 'pianoroll' ? 'block' : 'hidden lg:block'
-            }`}
-          >
+              {/* Playable Piano Keyboard Row Docked Below Piano Roll */}
+              <PianoKeyboardRow
+                baseOctave={baseOctave}
+                onBaseOctaveChange={(oct) => {
+                  setBaseOctave(oct);
+                  setRollTopMidi(clampMidi((oct + 2) * 12 + 2));
+                }}
+                rootKey={rootKey}
+                scaleType={scaleType}
+                soundLabel={activeVoiceDisplayLabel}
+                punchInRecord={punchInRecord}
+                onTogglePunchIn={() => setPunchInRecord((v) => !v)}
+                activePlayingMidis={activePlayingMidis}
+                onPlayKey={(midi) => onPlayKeyboardKey(midi, punchInRecord)}
+              />
+            </>
+          ) : (
             <section
               aria-label="Empty Stem Workspace"
-              className="flex min-h-[260px] flex-col items-center justify-center rounded-xl border border-dashed border-zinc-800 bg-[#111114]/70 p-6 text-center"
+              className="flex min-h-[220px] flex-col items-center justify-center rounded-xl border border-dashed border-[#2F3A47] bg-[#161C24] p-6 text-center"
             >
               <Music2 className="mb-2.5 h-8 w-8 text-zinc-600" />
               <h2 className="text-sm font-bold text-zinc-200">
-                No Melodic Stem Rows
+                No Melodic Stem Tracks
               </h2>
               <p className="mt-1 max-w-sm text-xs text-zinc-400">
-                Add a melodic or vocal stem row to record humming, edit piano roll notes, or layer instruments over Row 1.
+                Add a melodic or vocal stem track to hum melodies, edit piano roll notes, or layer instruments over Track 01.
               </p>
               <button
                 type="button"
-                onClick={onAddChannel}
+                onClick={() => {
+                  setInspectorTarget('channel');
+                  onAddChannel();
+                }}
                 className="mt-4 flex h-9 items-center gap-1.5 rounded-lg bg-amber-500 px-3.5 text-xs font-bold text-zinc-950 transition-colors hover:bg-amber-400"
               >
                 <Plus className="h-4 w-4" />
                 <span>Add Row</span>
               </button>
             </section>
-          </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
 
       {/* Voice & Dual-API Sound Browser Modal */}
       <StemVoiceBrowserModal

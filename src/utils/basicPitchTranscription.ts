@@ -21,11 +21,18 @@ export interface VocalTranscriptionOptions {
   stepDurationSec: number;
   stepCount: number;
   allowExtendedTimeline?: boolean;
+  polyphonic?: boolean;
   onsetThreshold?: number;
   frameThreshold?: number;
   minimumNoteLengthMs?: number;
   multiplePitchBends?: boolean;
   onProgress?: (progress: number) => void;
+}
+
+export interface ExtractedPolyphonicNote extends StemNote {
+  startTimeSeconds: number;
+  durationSeconds: number;
+  amplitude: number;
 }
 
 /**
@@ -450,7 +457,41 @@ export function convertBasicPitchNotesToStemNotes(
   return out.sort((a, b) => a.step - b.step || b.midi - a.midi);
 }
 
+let cachedSoftwareWebGl: boolean | null = null;
+
+export function isSoftwareWebGlEnvironment(): boolean {
+  if (cachedSoftwareWebGl !== null) return cachedSoftwareWebGl;
+  try {
+    let gl: WebGLRenderingContext | null = null;
+    if (typeof document !== 'undefined') {
+      const canvas = document.createElement('canvas');
+      gl =
+        (canvas.getContext('webgl2') as WebGLRenderingContext | null) ||
+        (canvas.getContext('webgl') as WebGLRenderingContext | null);
+    } else if (typeof OffscreenCanvas !== 'undefined') {
+      const oc = new OffscreenCanvas(1, 1);
+      gl =
+        (oc.getContext('webgl2') as WebGLRenderingContext | null) ||
+        (oc.getContext('webgl') as WebGLRenderingContext | null);
+    }
+    if (!gl) {
+      cachedSoftwareWebGl = true;
+      return true;
+    }
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    const renderer = dbg ? String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) ?? '') : '';
+    cachedSoftwareWebGl = /swiftshader|llvmpipe|software|basic render driver|mesa offscreen/i.test(
+      renderer
+    );
+    return cachedSoftwareWebGl;
+  } catch {
+    cachedSoftwareWebGl = true;
+    return true;
+  }
+}
+
 let basicPitchInstancePromise: Promise<{
+  tf: typeof import('@tensorflow/tfjs');
   bpModule: typeof import('@spotify/basic-pitch');
   model: InstanceType<(typeof import('@spotify/basic-pitch'))['BasicPitch']>;
 }> | null = null;
@@ -458,25 +499,54 @@ let basicPitchInstancePromise: Promise<{
 async function getBasicPitchInstance() {
   if (!basicPitchInstancePromise) {
     basicPitchInstancePromise = (async () => {
+      if (typeof (globalThis as { window?: unknown }).window === 'undefined') {
+        (globalThis as { window: typeof globalThis }).window = globalThis;
+      }
       const [tf, bpModule] = await Promise.all([
         import('@tensorflow/tfjs'),
         import('@spotify/basic-pitch'),
       ]);
-      try {
-        await tf.ready();
-      } catch {
+      const preferCpu = isSoftwareWebGlEnvironment();
+      if (preferCpu) {
         await tf.setBackend('cpu');
         await tf.ready();
+      } else {
+        try {
+          await tf.ready();
+        } catch {
+          await tf.setBackend('cpu');
+          await tf.ready();
+        }
       }
       const model = new bpModule.BasicPitch(BASIC_PITCH_MODEL_URL);
       await model.model;
-      return { bpModule, model };
+      return { tf, bpModule, model };
     })().catch((err) => {
       basicPitchInstancePromise = null;
       throw err;
     });
   }
   return basicPitchInstancePromise;
+}
+
+async function evaluateModelWithFallback(
+  audio: Float32Array,
+  onResult: (frames: number[][], onsets: number[][], contours: number[][]) => void,
+  onProgress: (pct: number) => void
+) {
+  const instance = await getBasicPitchInstance();
+  try {
+    await instance.model.evaluateModel(audio, onResult, onProgress);
+    return instance.bpModule;
+  } catch (err) {
+    if (instance.tf.getBackend() !== 'cpu') {
+      await instance.tf.setBackend('cpu');
+      await instance.tf.ready();
+      await instance.model.evaluateModel(audio, onResult, onProgress);
+      return instance.bpModule;
+    }
+    throw err;
+  }
 }
 
 export async function preloadBasicPitchModel(): Promise<void> {
@@ -538,13 +608,11 @@ export async function transcribeVocalAudioWithBasicPitch(
   const resampled22k = resampleMonoAudio(conditioned, sampleRate, BASIC_PITCH_SAMPLE_RATE);
   if (resampled22k.length < 512) return [];
 
-  const { bpModule, model } = await getBasicPitchInstance();
-
   const frames: number[][] = [];
   const onsets: number[][] = [];
   const contours: number[][] = [];
 
-  await model.evaluateModel(
+  const bpModule = await evaluateModelWithFallback(
     resampled22k,
     (f, o, c) => {
       frames.push(...f);
@@ -612,5 +680,198 @@ export async function transcribeVocalAudioWithBasicPitch(
     fullConditioned,
     sampleRate,
     Boolean(options.allowExtendedTimeline)
+  );
+}
+
+/**
+ * Polyphonic harmonic/melodic stem extraction using @spotify/basic-pitch.
+ * Preserves bass fundamentals (MIDI 28..49), mid-range chords, and high melodies
+ * simultaneously across arbitrary song durations on quantized 16th-note grids.
+ */
+export function normalizeHarmonicStemPcm(samples: Float32Array): Float32Array {
+  const n = samples.length;
+  if (n === 0) return new Float32Array(0);
+  let sumSq = 0;
+  let peak = 0;
+  for (let i = 0; i < n; i++) {
+    const a = Math.abs(samples[i]);
+    if (a > peak) peak = a;
+    sumSq += samples[i] * samples[i];
+  }
+  const rms = Math.sqrt(sumSq / n);
+  if (rms < 1e-5 && peak < 1e-5) return new Float32Array(n);
+
+  const targetRmsGain = rms > 1e-5 ? Math.min(4.5, 0.22 / rms) : 1;
+  const maxPeakSafe = peak > 1e-5 ? 0.92 / peak : 1;
+  const gain = Math.min(targetRmsGain, maxPeakSafe);
+
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = Math.max(-0.96, Math.min(0.96, samples[i] * gain));
+  }
+  return out;
+}
+
+export function convertPolyphonicBasicPitchNotes(
+  timedNotes: NoteEventTime[],
+  stepDurationSec: number,
+  maxSteps = 4096
+): ExtractedPolyphonicNote[] {
+  if (!Array.isArray(timedNotes) || timedNotes.length === 0) return [];
+  const safeStepDur = Math.max(0.03, stepDurationSec);
+  const valid = [...timedNotes]
+    .filter(
+      (n) =>
+        Number.isFinite(n.startTimeSeconds) &&
+        Number.isFinite(n.durationSeconds) &&
+        n.durationSeconds >= 0.04 &&
+        Number.isFinite(n.pitchMidi) &&
+        n.amplitude >= 0.14
+    )
+    .sort((a, b) => a.pitchMidi - b.pitchMidi || a.startTimeSeconds - b.startTimeSeconds);
+
+  // Merge tiny same-pitch re-articulations (<38ms gap)
+  const merged: NoteEventTime[] = [];
+  for (const curr of valid) {
+    const prev = merged[merged.length - 1];
+    if (
+      prev &&
+      Math.round(prev.pitchMidi) === Math.round(curr.pitchMidi) &&
+      curr.startTimeSeconds - (prev.startTimeSeconds + prev.durationSeconds) < 0.038
+    ) {
+      const end = Math.max(
+        prev.startTimeSeconds + prev.durationSeconds,
+        curr.startTimeSeconds + curr.durationSeconds
+      );
+      prev.durationSeconds = end - prev.startTimeSeconds;
+      prev.amplitude = Math.max(prev.amplitude, curr.amplitude);
+    } else {
+      merged.push({ ...curr });
+    }
+  }
+
+  const out: ExtractedPolyphonicNote[] = [];
+  const seen = new Set<string>();
+  for (const n of merged) {
+    const rawStep = n.startTimeSeconds / safeStepDur;
+    const step = Math.max(0, Math.min(maxSteps - 1, Math.round(rawStep)));
+    const midi = Math.max(28, Math.min(96, Math.round(n.pitchMidi)));
+    const key = `${step}:${midi}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const exactDur = Math.max(
+      0.25,
+      Math.min(32, Math.round((n.durationSeconds / safeStepDur) * 1000) / 1000)
+    );
+    const durationSteps = Math.max(1, Math.min(32, Math.round(exactDur)));
+    const velocity = Math.max(28, Math.min(100, Math.round(28 + Math.min(1, n.amplitude) * 72)));
+
+    out.push({
+      step,
+      midi,
+      durationSteps,
+      velocity,
+      startOffsetSteps: Math.max(
+        -0.45,
+        Math.min(0.45, Math.round((rawStep - step) * 1000) / 1000)
+      ),
+      exactDurationSteps: exactDur,
+      pitchBendSemitones: smoothPitchBendBins(n.pitchBends),
+      startTimeSeconds: n.startTimeSeconds,
+      durationSeconds: n.durationSeconds,
+      amplitude: n.amplitude,
+    });
+  }
+
+  return out.sort((a, b) => a.step - b.step || a.midi - b.midi);
+}
+
+export async function transcribePolyphonicStemWithBasicPitch(
+  pcm: Float32Array,
+  sampleRate: number,
+  options: {
+    stepDurationSec: number;
+    stepCount: number;
+    onsetThreshold?: number;
+    frameThreshold?: number;
+    minimumNoteLengthMs?: number;
+    onProgress?: (progress: number) => void;
+  }
+): Promise<ExtractedPolyphonicNote[]> {
+  if (pcm.length < 1024) return [];
+  const normalized = normalizeHarmonicStemPcm(pcm);
+  const resampled22k = resampleMonoAudio(normalized, sampleRate, BASIC_PITCH_SAMPLE_RATE);
+  if (resampled22k.length < 1024) return [];
+
+  // Process long songs in ~28s overlapping-safe bar-aligned chunks so TF.js memory stays bounded
+  const CHUNK_SEC = 28;
+  const chunkSamples = CHUNK_SEC * BASIC_PITCH_SAMPLE_RATE;
+  const totalSamples = resampled22k.length;
+  const allTimedNotes: NoteEventTime[] = [];
+  let cachedBpModule: typeof import('@spotify/basic-pitch') | null = null;
+
+  for (let offset = 0; offset < totalSamples; offset += chunkSamples) {
+    const end = Math.min(totalSamples, offset + chunkSamples);
+    const slice = resampled22k.subarray(offset, end);
+    if (slice.length < 1024) continue;
+
+    const frames: number[][] = [];
+    const onsets: number[][] = [];
+    const contours: number[][] = [];
+
+    const chunkStartRatio = offset / totalSamples;
+    const chunkSpanRatio = (end - offset) / totalSamples;
+
+    const bpMod = await evaluateModelWithFallback(
+      slice,
+      (f, o, c) => {
+        frames.push(...f);
+        onsets.push(...o);
+        contours.push(...c);
+      },
+      (pct) => {
+        options.onProgress?.(Math.min(1, chunkStartRatio + pct * chunkSpanRatio));
+      }
+    );
+    cachedBpModule = bpMod;
+    const bpModule = cachedBpModule;
+
+    if (frames.length === 0 || onsets.length === 0) continue;
+
+    const onsetThreshold = options.onsetThreshold ?? 0.34;
+    const frameThreshold = options.frameThreshold ?? 0.28;
+    const minNoteMs = options.minimumNoteLengthMs ?? 55;
+    const minNoteLenFrames = Math.max(
+      1,
+      Math.round((minNoteMs / 1000) * BASIC_PITCH_ANNOTATIONS_FPS) - 1
+    );
+
+    const rawNotes = bpModule.outputToNotesPoly(
+      frames,
+      onsets,
+      onsetThreshold,
+      frameThreshold,
+      minNoteLenFrames,
+      true,
+      1400,
+      45,
+      true,
+      11
+    );
+    const timed = bpModule.noteFramesToTime(rawNotes);
+    const offsetSec = offset / BASIC_PITCH_SAMPLE_RATE;
+    for (const tn of timed) {
+      allTimedNotes.push({
+        ...tn,
+        startTimeSeconds: tn.startTimeSeconds + offsetSec,
+      });
+    }
+  }
+
+  return convertPolyphonicBasicPitchNotes(
+    allTimedNotes,
+    options.stepDurationSec,
+    Math.max(16, options.stepCount)
   );
 }

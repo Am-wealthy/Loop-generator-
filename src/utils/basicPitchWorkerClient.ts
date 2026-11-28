@@ -1,18 +1,24 @@
 import type { StemNote } from '../types/sequencer.ts';
 import {
+  isSoftwareWebGlEnvironment,
   preloadBasicPitchModel,
+  transcribePolyphonicStemWithBasicPitch,
   transcribeVocalAudioWithBasicPitch,
+  type ExtractedPolyphonicNote,
   type VocalTranscriptionOptions,
 } from './basicPitchTranscription.ts';
+
+export { isSoftwareWebGlEnvironment };
 
 type WorkerResponse =
   | { type: 'ready'; id: number }
   | { type: 'progress'; id: number; progress: number }
   | { type: 'result'; id: number; notes: StemNote[] }
+  | { type: 'result_polyphonic'; id: number; notes: ExtractedPolyphonicNote[] }
   | { type: 'error'; id: number; message: string };
 
 interface PendingJob {
-  resolve: (value: StemNote[] | void) => void;
+  resolve: (value: StemNote[] | ExtractedPolyphonicNote[] | void) => void;
   reject: (reason?: unknown) => void;
   onProgress?: (progress: number) => void;
 }
@@ -42,6 +48,8 @@ function getWorker(): Worker | null {
         if (msg.type === 'ready') {
           job.resolve();
         } else if (msg.type === 'result') {
+          job.resolve(msg.notes);
+        } else if (msg.type === 'result_polyphonic') {
           job.resolve(msg.notes);
         } else if (msg.type === 'error') {
           job.reject(new Error(msg.message));
@@ -123,7 +131,57 @@ export async function transcribeVocalAudioInWorker(
     });
     return result;
   } catch {
-    // Graceful fallback if worker execution fails in constrained environments
     return transcribeVocalAudioWithBasicPitch(pcm, sampleRate, options);
   }
+}
+
+export async function transcribePolyphonicStemInWorker(
+  pcm: Float32Array,
+  sampleRate: number,
+  options: {
+    stepDurationSec: number;
+    stepCount: number;
+    onsetThreshold?: number;
+    frameThreshold?: number;
+    minimumNoteLengthMs?: number;
+    onProgress?: (progress: number) => void;
+  }
+): Promise<ExtractedPolyphonicNote[]> {
+  const worker = getWorker();
+  if (!worker) {
+    return transcribePolyphonicStemWithBasicPitch(pcm, sampleRate, options);
+  }
+
+  const id = nextJobId++;
+  const pcmCopy = new Float32Array(pcm);
+  try {
+    const result = await new Promise<ExtractedPolyphonicNote[]>((resolve, reject) => {
+      pendingJobs.set(id, {
+        resolve: (val) => resolve((val as ExtractedPolyphonicNote[]) ?? []),
+        reject,
+        onProgress: options.onProgress,
+      });
+      worker.postMessage(
+        {
+          type: 'transcribe_polyphonic',
+          id,
+          pcmBuffer: pcmCopy.buffer,
+          sampleRate,
+          stepDurationSec: options.stepDurationSec,
+          stepCount: msgSafe(options.stepCount),
+          onsetThreshold: options.onsetThreshold,
+          frameThreshold: options.frameThreshold,
+          minimumNoteLengthMs: options.minimumNoteLengthMs,
+        },
+        [pcmCopy.buffer]
+      );
+    });
+    return result;
+  } catch {
+    return transcribePolyphonicStemWithBasicPitch(pcm, sampleRate, options);
+  }
+}
+
+function msgSafe(stepCount: number): number {
+  return Math.max(16, Math.round(stepCount));
 }

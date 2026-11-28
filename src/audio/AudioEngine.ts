@@ -3,13 +3,16 @@ import type {
   KeyboardSoundId,
   LoopBars,
   PercussionTrack,
+  ReferenceDecompositionResult,
   ReverbRoomSize,
   SampleCandidate,
   StemChannel,
   StemLoopSource,
   TapLoopSettings,
   TapPad,
+  TransitionFxEvent,
 } from '../types/sequencer';
+import { BUILT_IN_PERCUSSION_LOOPS } from '../utils/referenceDecomposer';
 import {
   buildFallbackWaveformPeaks,
   clampBpm,
@@ -105,12 +108,20 @@ export class StudioAudioEngine {
   private nextStepTime = 0;
   private currentStep = 0;
 
-  private engineMode: 'sequencer' | 'taploop' | 'stems' = 'sequencer';
+  private engineMode: 'sequencer' | 'taploop' | 'stems' | 'decomposer' = 'sequencer';
   private tapPads: TapPad[] = [];
   private metronomeEnabled = true;
   private tapSettings: TapLoopSettings = { ...DEFAULT_TAP_LOOP_SETTINGS };
   private skipOnceMap = new Map<string, { stepIndex: number; untilTime: number }>();
   private customTapBuffers = new Map<string, AudioBuffer>();
+
+  // Reference Song Decomposer state
+  private decomposerResult: ReferenceDecompositionResult | null = null;
+  private decomposerRefBuffer: AudioBuffer | null = null;
+  private decomposerRefSource: AudioBufferSourceNode | null = null;
+  private decomposerRefGain: GainNode | null = null;
+  private decomposerOriginalMix = 0; // 0 = Extracted Stems Only, 1 = Original Reference Song Only
+  private decomposerNoiseBuffer: AudioBuffer | null = null;
 
   // Stem Builder state
   private stemChannels: StemChannel[] = [];
@@ -390,7 +401,7 @@ export class StudioAudioEngine {
   }
 
   public updateTapLoopState(params: {
-    mode: 'sequencer' | 'taploop' | 'stems';
+    mode: 'sequencer' | 'taploop' | 'stems' | 'decomposer';
     tapPads: TapPad[];
     tapClickEnabled: boolean;
     tapSettings?: TapLoopSettings;
@@ -407,6 +418,127 @@ export class StudioAudioEngine {
       };
     }
     this.applyTapSettingsToAudioNodes();
+  }
+
+  public setDecomposerData(result: ReferenceDecompositionResult | null): void {
+    this.decomposerResult = result;
+    if (result && this.engineMode === 'decomposer') {
+      this.bpm = clampBpm(result.bpm);
+    }
+  }
+
+  public setDecomposerReferenceBuffer(buffer: AudioBuffer | null): void {
+    this.stopDecomposerRefSource();
+    this.decomposerRefBuffer = buffer;
+  }
+
+  public setDecomposerOriginalMix(mix: number): void {
+    this.decomposerOriginalMix = clampUnit(mix);
+    this.applyBlend();
+  }
+
+  public async toggleDecomposerPlayback(
+    result: ReferenceDecompositionResult,
+    startBar = 0
+  ): Promise<boolean> {
+    const ctx = this.unlockSync();
+    if (this.isPlaying && this.engineMode === 'decomposer') {
+      this.stop();
+      return false;
+    }
+    if (this.isPlaying) {
+      this.stop();
+    }
+    this.engineMode = 'decomposer';
+    this.decomposerResult = result;
+    this.bpm = clampBpm(result.bpm);
+    this.ensureClickBuffersCached(ctx);
+    this.isPlaying = true;
+    const clampedBar = Math.max(0, Math.min(result.totalBars - 1, startBar));
+    this.currentStep = clampedBar * 16;
+    this.nextStepTime = ctx.currentTime + 0.025;
+    this.applyBlend();
+    this.startDecomposerRefSource(this.nextStepTime, clampedBar);
+    this.scheduler();
+    this.timerId = window.setInterval(() => this.scheduler(), LOOKAHEAD_MS);
+
+    if (ctx.state !== 'running') {
+      void ctx
+        .resume()
+        .then(() => {
+          if (this.onAudioStateChangeCallback) {
+            this.onAudioStateChangeCallback(ctx.state);
+          }
+          if (this.isPlaying && ctx.state === 'running') {
+            if (this.nextStepTime < ctx.currentTime - 0.02) {
+              this.nextStepTime = ctx.currentTime + 0.015;
+            }
+            this.scheduler();
+          }
+        })
+        .catch(() => undefined);
+    }
+    return true;
+  }
+
+  public seekDecomposerBar(barIndex: number): void {
+    if (!this.decomposerResult || this.engineMode !== 'decomposer') return;
+    const clampedBar = Math.max(
+      0,
+      Math.min(this.decomposerResult.totalBars - 1, barIndex)
+    );
+    this.currentStep = clampedBar * 16;
+    if (this.isPlaying && this.ctx) {
+      this.nextStepTime = this.ctx.currentTime + 0.02;
+      this.startDecomposerRefSource(this.nextStepTime, clampedBar);
+    }
+    if (this.onStepCallback) {
+      this.onStepCallback(this.currentStep);
+    }
+  }
+
+  private startDecomposerRefSource(when: number, startBar: number): void {
+    this.stopDecomposerRefSource();
+    if (!this.decomposerRefBuffer || !this.decomposerResult || !this.ctx || !this.masterCompressor) {
+      return;
+    }
+    const stepDuration = getStepDurationSeconds(this.decomposerResult.bpm);
+    const offsetSec = Math.max(
+      0,
+      this.decomposerResult.beatOffsetSec + startBar * 16 * stepDuration
+    );
+    if (offsetSec >= this.decomposerRefBuffer.duration - 0.05) return;
+
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.decomposerRefBuffer;
+    const gain = this.ctx.createGain();
+    const origGain = this.decomposerOriginalMix;
+    gain.gain.setValueAtTime(origGain, when);
+    src.connect(gain);
+    gain.connect(this.masterCompressor);
+    src.start(when, offsetSec);
+    this.decomposerRefSource = src;
+    this.decomposerRefGain = gain;
+  }
+
+  private stopDecomposerRefSource(): void {
+    if (this.decomposerRefSource) {
+      try {
+        this.decomposerRefSource.stop();
+        this.decomposerRefSource.disconnect();
+      } catch {
+        // Already stopped
+      }
+      this.decomposerRefSource = null;
+    }
+    if (this.decomposerRefGain) {
+      try {
+        this.decomposerRefGain.disconnect();
+      } catch {
+        // Ignore
+      }
+      this.decomposerRefGain = null;
+    }
   }
 
   private computeEffectiveStemLoopGain(): number {
@@ -828,6 +960,21 @@ export class StudioAudioEngine {
   }
 
   private applyBlend(): void {
+    if (this.engineMode === 'decomposer') {
+      const mix = this.decomposerOriginalMix;
+      const stemsGain = mix > 0.96 ? 0 : Math.max(0.28, 1 - mix * 0.68);
+      if (this.ctx && this.percussionBus) {
+        this.percussionBus.gain.setTargetAtTime(stemsGain, this.ctx.currentTime, 0.018);
+      }
+      if (this.ctx && this.decomposerRefGain) {
+        this.decomposerRefGain.gain.setTargetAtTime(mix, this.ctx.currentTime, 0.018);
+      }
+      if (this.ctx && this.originalBus) {
+        this.originalBus.gain.setTargetAtTime(0, this.ctx.currentTime, 0.015);
+      }
+      return;
+    }
+
     const percGain =
       this.blendRatio <= 0.5 ? 1 : Math.max(0.2, 1 - (this.blendRatio - 0.5) * 1.6);
     const hasOrig = Boolean(this.originalBuffer || this.fallbackAudioEl);
@@ -1606,6 +1753,7 @@ export class StudioAudioEngine {
     this.stopActiveHumSources();
     this.stopStemHumPreview();
     this.stopStemPhoneLoopSource();
+    this.stopDecomposerRefSource();
     this.stopOriginalSource();
     if (this.silentKeepaliveEl && !this.silentKeepaliveEl.paused) {
       try {
@@ -1674,7 +1822,11 @@ export class StudioAudioEngine {
       this.engineMode === 'stems'
         ? getSongTimelineSteps(this.stemChannels, percStepCount)
         : percStepCount;
-    const stepDuration = getStepDurationSeconds(this.bpm);
+    const activeBpm =
+      this.engineMode === 'decomposer' && this.decomposerResult
+        ? this.decomposerResult.bpm
+        : this.bpm;
+    const stepDuration = getStepDurationSeconds(activeBpm);
 
     // Clamp drift so steps are never scheduled far in the past after thread stalls or resume latency
     if (this.nextStepTime < this.ctx.currentTime - 0.04) {
@@ -1682,7 +1834,16 @@ export class StudioAudioEngine {
     }
 
     while (this.nextStepTime < this.ctx.currentTime + SCHEDULE_AHEAD_SEC) {
-      if (this.engineMode === 'taploop') {
+      if (this.engineMode === 'decomposer' && this.decomposerResult) {
+        const decompSteps = Math.max(16, this.decomposerResult.totalSteps);
+        const stepToSchedule = this.currentStep % decompSteps;
+        if (stepToSchedule === 0 && this.currentStep > 0) {
+          this.startDecomposerRefSource(this.nextStepTime, 0);
+        }
+        this.scheduleDecomposerStep(stepToSchedule, this.nextStepTime, stepDuration);
+        this.nextStepTime += stepDuration;
+        this.currentStep = (this.currentStep + 1) % decompSteps;
+      } else if (this.engineMode === 'taploop') {
         const stepToSchedule = this.currentStep % percStepCount;
         this.scheduleTapLoopStep(stepToSchedule, this.nextStepTime);
         this.nextStepTime += stepDuration;
@@ -1703,6 +1864,233 @@ export class StudioAudioEngine {
         this.currentStep = (this.currentStep + 1) % percStepCount;
       }
     }
+  }
+
+  private getOrCreateDecomposerNoiseBuffer(ctx: BaseAudioContext): AudioBuffer {
+    if (
+      this.decomposerNoiseBuffer &&
+      this.decomposerNoiseBuffer.sampleRate === ctx.sampleRate
+    ) {
+      return this.decomposerNoiseBuffer;
+    }
+    const sr = ctx.sampleRate;
+    const len = sr * 4;
+    const buf = ctx.createBuffer(1, len, sr);
+    const ch = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < len; i++) {
+      const white = Math.random() * 2 - 1;
+      last = last * 0.18 + white * 0.82;
+      ch[i] = last;
+    }
+    this.decomposerNoiseBuffer = buf;
+    return buf;
+  }
+
+  private scheduleTransitionFxEvent(
+    ctx: BaseAudioContext,
+    destination: AudioNode,
+    event: TransitionFxEvent,
+    stepDuration: number,
+    volumeDb: number,
+    when: number
+  ): void {
+    const durSec = Math.max(0.25, event.durationSteps * stepDuration);
+    const gainScale = dbToGain(volumeDb) * event.intensity * 0.48;
+    if (gainScale <= 0.001) return;
+
+    if (event.type === 'sub_impact') {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(98, when);
+      osc.frequency.exponentialRampToValueAtTime(34, when + Math.min(0.65, durSec));
+
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.001, when);
+      gain.gain.linearRampToValueAtTime(gainScale * 1.45, when + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.001, when + Math.min(0.85, durSec));
+
+      osc.connect(gain);
+      gain.connect(destination);
+      osc.start(when);
+      osc.stop(when + Math.min(0.9, durSec + 0.05));
+      return;
+    }
+
+    const noiseSrc = ctx.createBufferSource();
+    noiseSrc.buffer = this.getOrCreateDecomposerNoiseBuffer(ctx);
+    noiseSrc.loop = true;
+
+    const filter = ctx.createBiquadFilter();
+    const env = ctx.createGain();
+    noiseSrc.connect(filter);
+    filter.connect(env);
+    env.connect(destination);
+
+    if (event.type === 'riser') {
+      filter.type = 'bandpass';
+      filter.Q.setValueAtTime(2.6, when);
+      filter.frequency.setValueAtTime(220, when);
+      filter.frequency.exponentialRampToValueAtTime(4800, when + durSec);
+      env.gain.setValueAtTime(0.001, when);
+      env.gain.exponentialRampToValueAtTime(gainScale * 0.85, when + Math.max(0.1, durSec - 0.03));
+      env.gain.linearRampToValueAtTime(0.0008, when + durSec);
+
+      // Add subtle pitch sweep under noise riser
+      const pitchOsc = ctx.createOscillator();
+      pitchOsc.type = 'triangle';
+      pitchOsc.frequency.setValueAtTime(140, when);
+      pitchOsc.frequency.exponentialRampToValueAtTime(620, when + durSec);
+      const pitchGain = ctx.createGain();
+      pitchGain.gain.setValueAtTime(0.001, when);
+      pitchGain.gain.exponentialRampToValueAtTime(gainScale * 0.28, when + Math.max(0.1, durSec - 0.04));
+      pitchGain.gain.linearRampToValueAtTime(0.0008, when + durSec);
+      pitchOsc.connect(pitchGain);
+      pitchGain.connect(destination);
+      pitchOsc.start(when);
+      pitchOsc.stop(when + durSec + 0.02);
+    } else if (event.type === 'reverse_cymbal') {
+      filter.type = 'highpass';
+      filter.Q.setValueAtTime(1.4, when);
+      filter.frequency.setValueAtTime(2200, when);
+      filter.frequency.exponentialRampToValueAtTime(8400, when + durSec);
+      env.gain.setValueAtTime(0.001, when);
+      env.gain.exponentialRampToValueAtTime(gainScale * 0.9, when + Math.max(0.08, durSec - 0.015));
+      env.gain.linearRampToValueAtTime(0.0005, when + durSec);
+    } else {
+      // Air / Downlift sweep
+      filter.type = 'bandpass';
+      filter.Q.setValueAtTime(1.8, when);
+      filter.frequency.setValueAtTime(3600, when);
+      filter.frequency.exponentialRampToValueAtTime(240, when + durSec);
+      env.gain.setValueAtTime(gainScale * 0.72, when);
+      env.gain.exponentialRampToValueAtTime(0.001, when + durSec);
+    }
+
+    noiseSrc.start(when);
+    noiseSrc.stop(when + durSec + 0.04);
+  }
+
+  private scheduleDecomposerStep(
+    stepIndex: number,
+    when: number,
+    stepDuration: number
+  ): void {
+    if (!this.ctx || !this.percussionBus || !this.decomposerResult) return;
+
+    const result = this.decomposerResult;
+    const barIdx = Math.floor(stepIndex / 16);
+    const stepInBar = stepIndex % 16;
+
+    const anySoloed = Boolean(
+      result.track1Soloed ||
+        result.fxSoloed ||
+        result.instrumentTracks.some((t) => Boolean(t.soloed))
+    );
+
+    // Track 1: Dynamic Percussion Loop (only on rhythmic bars — intro/breakdown stay silent)
+    const activeClip = result.track1Clips.find(
+      (c) => barIdx >= c.startBar && barIdx < c.endBar
+    );
+    const track1Audible =
+      Boolean(activeClip) &&
+      !result.track1Muted &&
+      (!anySoloed || result.track1Soloed);
+
+    if (activeClip && track1Audible) {
+      const template = BUILT_IN_PERCUSSION_LOOPS[activeClip.loopPresetId];
+      for (const layer of template.layers) {
+        const rawVel = layer.steps16[stepInBar] ?? 0;
+        if (rawVel <= 0) continue;
+        const vel = Math.max(15, Math.min(100, Math.round(rawVel * activeClip.intensity)));
+        const buf = this.getOrCreateFallbackBuffer(this.ctx, layer.instrumentId);
+        this.triggerBufferAt(
+          this.ctx,
+          this.percussionBus,
+          buf,
+          {
+            instrument_id: layer.instrumentId,
+            display_name: layer.displayName,
+            sample_search_query: layer.instrumentId,
+            volume_db: result.track1VolumeDb + layer.volumeDb,
+            pan: layer.pan,
+            steps: [],
+          },
+          vel,
+          when
+        );
+      }
+    }
+
+    // Optional Metronome guide if enabled
+    if (this.metronomeEnabled && stepInBar % 4 === 0) {
+      const isBeatOne = stepInBar === 0;
+      const clickBuf = this.getOrCreateFallbackBuffer(
+        this.ctx,
+        isBeatOne ? 'click_hi' : 'click_lo'
+      );
+      this.triggerPadBufferAt(
+        this.ctx,
+        this.percussionBus,
+        clickBuf,
+        isBeatOne ? -4 : -7,
+        isBeatOne ? 90 : 72,
+        when
+      );
+    }
+
+    // Tracks 2..19: Extracted polyphonic MIDI instrument voices
+    for (const track of result.instrumentTracks) {
+      if (!track.isActive || track.muted || (anySoloed && !track.soloed)) continue;
+      for (const note of track.notes) {
+        if (note.step !== stepIndex) continue;
+        const noteWhen = Math.max(
+          this.ctx.currentTime + 0.002,
+          when + (note.startOffsetSteps ?? 0) * stepDuration
+        );
+        const noteDur = Math.max(
+          0.032,
+          (note.exactDurationSteps ?? note.durationSteps) * stepDuration
+        );
+        this.scheduleKeyboardSynthNote(
+          this.ctx,
+          this.percussionBus,
+          track.soundId,
+          note.midi,
+          noteDur,
+          track.volume_db,
+          track.pan,
+          note.velocity,
+          noteWhen,
+          note.pitchBendSemitones,
+          note.velocityCurve
+        );
+      }
+    }
+
+    // Tracks 20..21: Section Transition FX (Risers, Reverse Cymbals, Sweeps, Sub-Impacts)
+    const fxAudible = !result.fxMuted && (!anySoloed || result.fxSoloed);
+    if (fxAudible) {
+      for (const ev of result.transitionFxEvents) {
+        if (ev.triggerStep === stepIndex) {
+          this.scheduleTransitionFxEvent(
+            this.ctx,
+            this.percussionBus,
+            ev,
+            stepDuration,
+            result.fxVolumeDb,
+            when
+          );
+        }
+      }
+    }
+
+    const delayMs = Math.max(0, (when - this.ctx.currentTime) * 1000);
+    window.setTimeout(() => {
+      if (this.isPlaying && this.onStepCallback) {
+        this.onStepCallback(stepIndex);
+      }
+    }, delayMs);
   }
 
   private scheduleStemsStep(
@@ -2089,7 +2477,59 @@ export class StudioAudioEngine {
 
     const smoothAttack = Math.min(0.018, safeDur * 0.28);
 
-    if (soundId === 'worship_bass') {
+    if (soundId === 'sub_bass') {
+      const subFreq = midi >= 48 ? freq * 0.5 : freq;
+      const o1 = ctx.createOscillator();
+      o1.type = 'sine';
+      o1.frequency.setValueAtTime(subFreq, when);
+      const o2 = ctx.createOscillator();
+      o2.type = 'triangle';
+      o2.frequency.setValueAtTime(subFreq * 2, when);
+      const g2 = ctx.createGain();
+      g2.gain.setValueAtTime(0.18, when);
+      o1.connect(filter);
+      o2.connect(g2);
+      g2.connect(filter);
+      addOscWithBend(o1, 0);
+      addOscWithBend(o2, 0);
+
+      filter.frequency.setValueAtTime(Math.min(480, subFreq * 4.5), when);
+      envGain.gain.setValueAtTime(0.001, when);
+      envGain.gain.linearRampToValueAtTime(peakGain * 1.25, when + Math.min(0.018, smoothAttack));
+      envGain.gain.setValueAtTime(
+        peakGain * 1.15,
+        Math.max(when + smoothAttack + 0.005, noteEnd - 0.02)
+      );
+      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.1);
+    } else if (soundId === 'strings') {
+      const strOscs: OscillatorNode[] = [];
+      [-7.5, -2.5, 2.5, 7.5].forEach((cents, idx) => {
+        const osc = ctx.createOscillator();
+        osc.type = idx % 2 === 0 ? 'sawtooth' : 'triangle';
+        osc.frequency.setValueAtTime(freq, when);
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(idx % 2 === 0 ? 0.24 : 0.34, when);
+        osc.connect(g);
+        g.connect(filter);
+        addOscWithBend(osc, cents);
+        strOscs.push(osc);
+      });
+      attachGentleVibrato(strOscs, 5.5);
+      filter.Q.setValueAtTime(1.1, when);
+      filter.frequency.setValueAtTime(850 * velBrightness, when);
+      filter.frequency.linearRampToValueAtTime(
+        Math.max(1100, 2900 * velBrightness),
+        when + Math.min(0.11, safeDur * 0.6)
+      );
+      const strAttack = Math.min(0.075, safeDur * 0.45);
+      envGain.gain.setValueAtTime(0.001, when);
+      envGain.gain.linearRampToValueAtTime(peakGain * 0.85, when + strAttack);
+      envGain.gain.setValueAtTime(
+        peakGain * 0.8,
+        Math.max(when + strAttack + 0.006, noteEnd - 0.02)
+      );
+      envGain.gain.exponentialRampToValueAtTime(0.001, noteEnd + 0.22);
+    } else if (soundId === 'worship_bass') {
       const o1 = ctx.createOscillator();
       o1.type = 'triangle';
       o1.frequency.setValueAtTime(freq, when);

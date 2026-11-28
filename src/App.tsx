@@ -26,11 +26,13 @@ import type {
   KeyboardSoundId,
   LoopBars,
   PercussionTrack,
+  ReferenceDecompositionResult,
   SampleCandidate,
   ScaleType,
   StemChannel,
   StemLoopSource,
   StemNote,
+  StemSubPage,
   StemVoiceMode,
   StudioPage,
   TapLoopSettings,
@@ -271,6 +273,16 @@ function AppContent() {
   const [phoneLoopDurationSec, setPhoneLoopDurationSec] = useState(0);
   const [phoneLoopPeaks, setPhoneLoopPeaks] = useState<number[]>([]);
 
+  // Stem Builder Sub-Page & Reference Song Decomposer state
+  const [stemSubPage, setStemSubPage] = useState<StemSubPage>(() => {
+    if (typeof window === 'undefined') return 'studio';
+    const sp = new URLSearchParams(window.location.search).get('subpage');
+    return sp === 'decomposer' ? 'decomposer' : 'studio';
+  });
+  const [decomposerResult, setDecomposerResult] =
+    useState<ReferenceDecompositionResult | null>(null);
+  const [decomposerOriginalMix, setDecomposerOriginalMix] = useState<number>(0);
+
   // Stem Builder Undo / Redo History State
   const [stemHistory, setStemHistory] = useState<StemHistoryState>(() => {
     const defaults = createDefaultStemChannels();
@@ -314,7 +326,9 @@ function AppContent() {
       activePage === 'taploop'
         ? 'taploop'
         : activePage === 'stems'
-        ? 'stems'
+        ? stemSubPage === 'decomposer'
+          ? 'decomposer'
+          : 'stems'
         : 'sequencer';
     engineRef.current?.updateTapLoopState({
       mode,
@@ -322,7 +336,7 @@ function AppContent() {
       tapClickEnabled: metronomeEnabled,
       tapSettings,
     });
-  }, [activePage, tapPads, metronomeEnabled, tapSettings]);
+  }, [activePage, stemSubPage, tapPads, metronomeEnabled, tapSettings]);
 
   useEffect(() => {
     engineRef.current?.updateStemState({
@@ -472,6 +486,18 @@ function AppContent() {
   const handleTogglePlay = useCallback(async () => {
     const engine = engineRef.current;
     if (!engine) return;
+    if (activePage === 'stems' && stemSubPage === 'decomposer') {
+      if (isPlaying) {
+        engine.stop();
+        setIsPlaying(false);
+        setCurrentStep(-1);
+      } else if (decomposerResult) {
+        const playing = await engine.toggleDecomposerPlayback(decomposerResult, 0);
+        setIsPlaying(playing);
+        setAudioContextState(engine.getAudioContextState());
+      }
+      return;
+    }
     const ctx = engine.unlockSync();
     setAudioContextState(ctx.state);
     if (isPlaying) {
@@ -483,7 +509,7 @@ function AppContent() {
       await engine.start();
       setAudioContextState(engine.getAudioContextState());
     }
-  }, [isPlaying]);
+  }, [activePage, stemSubPage, decomposerResult, isPlaying]);
 
   const handleSelectPage = useCallback(
     (nextPage: StudioPage) => {
@@ -1431,6 +1457,95 @@ function AppContent() {
     []
   );
 
+  const handleSelectStemSubPage = useCallback((nextSub: StemSubPage) => {
+    engineRef.current?.stop();
+    setIsPlaying(false);
+    setCurrentStep(-1);
+    setStemSubPage(nextSub);
+  }, []);
+
+  const handleDecomposerResultChange = useCallback(
+    (next: ReferenceDecompositionResult | null) => {
+      setDecomposerResult(next);
+      engineRef.current?.setDecomposerData(next);
+    },
+    []
+  );
+
+  const handleDecomposerRefBufferChange = useCallback((buffer: AudioBuffer | null) => {
+    engineRef.current?.setDecomposerReferenceBuffer(buffer);
+  }, []);
+
+  const handleDecomposerOriginalMixChange = useCallback((mix: number) => {
+    setDecomposerOriginalMix(mix);
+    engineRef.current?.setDecomposerOriginalMix(mix);
+  }, []);
+
+  const handleDecomposerTogglePlay = useCallback(
+    async (result: ReferenceDecompositionResult, startBar = 0) => {
+      const engine = engineRef.current;
+      if (!engine) return;
+      const playing = await engine.toggleDecomposerPlayback(result, startBar);
+      setIsPlaying(playing);
+      if (!playing) setCurrentStep(-1);
+      setAudioContextState(engine.getAudioContextState());
+    },
+    []
+  );
+
+  const handleDecomposerSeekBar = useCallback((barIndex: number) => {
+    engineRef.current?.seekDecomposerBar(barIndex);
+  }, []);
+
+  const handleDecomposerStop = useCallback(() => {
+    engineRef.current?.stop();
+    setIsPlaying(false);
+    setCurrentStep(-1);
+  }, []);
+
+  const handleLoadDecomposedIntoStudio = useCallback(
+    (result: ReferenceDecompositionResult) => {
+      engineRef.current?.stop();
+      setIsPlaying(false);
+      setCurrentStep(-1);
+      setBpm(clampBpm(result.bpm));
+
+      const activeTracks = result.instrumentTracks.filter((t) => t.isActive);
+      const importedChannels: StemChannel[] =
+        activeTracks.length > 0
+          ? activeTracks.map((t, idx) => ({
+              id: `stem-decomp-${t.trackNumber}-${Date.now()}`,
+              name: `Row ${idx + 2} · ${t.name}`,
+              color: t.color,
+              soundId: t.soundId,
+              voiceMode: 'keyboard',
+              hasHumAudio: false,
+              muted: t.muted,
+              soloed: false,
+              volume_db: t.volume_db,
+              pan: t.pan,
+              totalSteps: result.totalSteps,
+              notes: t.notes.map((n) => ({ ...n })),
+            }))
+          : createDefaultStemChannels();
+
+      commitStemUpdate((p) => ({
+        ...p,
+        stemKey: result.rootKey,
+        stemScale: result.scaleType,
+        stemChannels: importedChannels,
+        selectedChannelId: importedChannels[0]?.id ?? p.selectedChannelId,
+      }));
+
+      setStemSubPage('studio');
+      setStatusBanner(
+        `Imported ${activeTracks.length} extracted instrument channels (${result.bpm} BPM, ${result.rootKey} ${result.scaleType}) into Stem Studio`
+      );
+      window.setTimeout(() => setStatusBanner(null), 4000);
+    },
+    [commitStemUpdate]
+  );
+
   const handleConfirmExport = async (options: ExportOptions) => {
     if (!engineRef.current || isExporting) return;
     setIsExporting(true);
@@ -1688,19 +1803,22 @@ function AppContent() {
         : ch.notes.length),
     0
   );
-  const audioDiagnostic = getPlaybackAudioDiagnostic({
-    isPlaying,
-    audioContextState,
-    activePage,
-    metronomeEnabled,
-    hasPlayableOriginal,
-    blendRatio,
-    activeTapPadStepCount,
-    stemLoopSource,
-    stemLoopMuted,
-    hasPhoneLoopAudio: Boolean(phoneLoopFileName),
-    audibleStemNotesOrHumCount,
-  });
+  const audioDiagnostic =
+    activePage === 'stems' && stemSubPage === 'decomposer'
+      ? null
+      : getPlaybackAudioDiagnostic({
+          isPlaying,
+          audioContextState,
+          activePage,
+          metronomeEnabled,
+          hasPlayableOriginal,
+          blendRatio,
+          activeTapPadStepCount,
+          stemLoopSource,
+          stemLoopMuted,
+          hasPhoneLoopAudio: Boolean(phoneLoopFileName),
+          audibleStemNotesOrHumCount,
+        });
 
   return (
     <div className="min-h-screen overflow-x-hidden bg-[#09090B] text-zinc-100 pb-36">
@@ -1917,6 +2035,17 @@ function AppContent() {
             onStopHumPreview={handleStopHumPreview}
             onAuditionKeyboardVoice={handleAuditionKeyboardVoice}
             onOpenFreesoundKeyModal={() => setIsFreesoundModalOpen(true)}
+            stemSubPage={stemSubPage}
+            onSelectStemSubPage={handleSelectStemSubPage}
+            decomposerResult={decomposerResult}
+            decomposerOriginalMix={decomposerOriginalMix}
+            onDecomposerResultChange={handleDecomposerResultChange}
+            onDecomposerRefBufferChange={handleDecomposerRefBufferChange}
+            onDecomposerOriginalMixChange={handleDecomposerOriginalMixChange}
+            onDecomposerTogglePlay={handleDecomposerTogglePlay}
+            onDecomposerSeekBar={handleDecomposerSeekBar}
+            onDecomposerStop={handleDecomposerStop}
+            onLoadDecomposedIntoStudio={handleLoadDecomposedIntoStudio}
           />
         )}
       </main>

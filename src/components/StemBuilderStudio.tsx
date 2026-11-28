@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowLeft,
   ArrowRight,
+  AudioWaveform,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
@@ -24,11 +25,13 @@ import type {
   KeyboardSoundId,
   LoopBars,
   PercussionTrack,
+  ReferenceDecompositionResult,
   SampleCandidate,
   ScaleType,
   StemChannel,
   StemLoopSource,
   StemNote,
+  StemSubPage,
   StemVoiceMode,
   TapPad,
 } from '../types/sequencer';
@@ -56,6 +59,7 @@ import {
   transcribeVocalAudioInWorker,
 } from '../utils/basicPitchWorkerClient';
 import { PianoKeyboardRow } from './PianoKeyboardRow';
+import { StemReferenceDecomposer } from './StemReferenceDecomposer';
 import { StemVoiceBrowserModal } from './StemVoiceBrowserModal';
 
 const registeredHumWorkletContexts = new WeakSet<AudioContext>();
@@ -171,6 +175,20 @@ interface StemBuilderStudioProps {
   onStopHumPreview: () => void;
   onAuditionKeyboardVoice: (soundId: KeyboardSoundId) => void;
   onOpenFreesoundKeyModal: () => void;
+  stemSubPage: StemSubPage;
+  onSelectStemSubPage: (subPage: StemSubPage) => void;
+  decomposerResult: ReferenceDecompositionResult | null;
+  decomposerOriginalMix: number;
+  onDecomposerResultChange: (next: ReferenceDecompositionResult | null) => void;
+  onDecomposerRefBufferChange: (buffer: AudioBuffer | null) => void;
+  onDecomposerOriginalMixChange: (mix: number) => void;
+  onDecomposerTogglePlay: (
+    result: ReferenceDecompositionResult,
+    startBar?: number
+  ) => Promise<void>;
+  onDecomposerSeekBar: (barIndex: number) => void;
+  onDecomposerStop: () => void;
+  onLoadDecomposedIntoStudio: (result: ReferenceDecompositionResult) => void;
 }
 
 const CHANNEL_ACCENT: Record<
@@ -311,6 +329,17 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
   onStopHumPreview,
   onAuditionKeyboardVoice,
   onOpenFreesoundKeyModal,
+  stemSubPage,
+  onSelectStemSubPage,
+  decomposerResult,
+  decomposerOriginalMix,
+  onDecomposerResultChange,
+  onDecomposerRefBufferChange,
+  onDecomposerOriginalMixChange,
+  onDecomposerTogglePlay,
+  onDecomposerSeekBar,
+  onDecomposerStop,
+  onLoadDecomposedIntoStudio,
 }) => {
   const selectedChannel =
     stemChannels.find((c) => c.id === selectedChannelId) ?? stemChannels[0];
@@ -1075,17 +1104,79 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
 
   return (
     <div className="space-y-3 pb-14 lg:pb-4">
-      {/* Hidden input for uploading Phone Audio Loop into Track 01 */}
-      <input
-        ref={phoneFileInputRef}
-        type="file"
-        accept="audio/*,video/mp4,.mp3,.wav,.m4a,.mp4,.aac,.ogg,.opus,.flac,.webm,.3gp,.amr"
-        className="hidden"
-        onChange={(e) => void handlePhoneLoopFileChange(e)}
-      />
+      {/* INTERNAL STEM BUILDER SUB-PAGE NAVIGATION */}
+      <nav
+        aria-label="Stem Builder pages"
+        className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[#2F3A47] bg-[#141920] px-3 py-2"
+      >
+        <div className="flex items-center gap-1 rounded-lg border border-[#2C3643] bg-[#0F141A] p-0.5">
+          <button
+            type="button"
+            onClick={() => onSelectStemSubPage('studio')}
+            aria-current={stemSubPage === 'studio' ? 'page' : undefined}
+            className={`flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-bold transition-colors whitespace-nowrap shrink-0 ${
+              stemSubPage === 'studio'
+                ? 'bg-amber-500 text-zinc-950'
+                : 'text-zinc-300 hover:bg-[#1E252E] hover:text-white'
+            }`}
+          >
+            <Layers className="h-3.5 w-3.5" />
+            <span>Studio Arrangement</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (hummingChannelId) stopHumCapture();
+              onSelectStemSubPage('decomposer');
+            }}
+            aria-current={stemSubPage === 'decomposer' ? 'page' : undefined}
+            className={`flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-bold transition-colors whitespace-nowrap shrink-0 ${
+              stemSubPage === 'decomposer'
+                ? 'bg-amber-500 text-zinc-950'
+                : 'text-zinc-300 hover:bg-[#1E252E] hover:text-white'
+            }`}
+          >
+            <AudioWaveform className="h-3.5 w-3.5" />
+            <span>Reference Decomposer</span>
+          </button>
+        </div>
 
-      {/* TOP FL-STUDIO PLAYLIST TOOLBAR */}
-      <section className="rounded-xl border border-[#2F3A47] bg-[#1A2027] px-3 py-2.5 sm:px-4">
+        <span className="hidden text-xs text-zinc-400 sm:inline">
+          {stemSubPage === 'decomposer'
+            ? 'Analyze reference audio into structural sections, light Track 1 loops, 18 instrument channels & Transition FX'
+            : 'Sing, hum, or program multi-track melodic stems over your loop bed'}
+        </span>
+      </nav>
+
+      {stemSubPage === 'decomposer' ? (
+        <StemReferenceDecomposer
+          decomposition={decomposerResult}
+          isPlaying={isPlaying}
+          currentStep={currentStep}
+          originalMix={decomposerOriginalMix}
+          onDecompositionChange={onDecomposerResultChange}
+          onSetReferenceBuffer={onDecomposerRefBufferChange}
+          onOriginalMixChange={onDecomposerOriginalMixChange}
+          onTogglePlay={onDecomposerTogglePlay}
+          onSeekBar={onDecomposerSeekBar}
+          onStopPlayback={onDecomposerStop}
+          onLoadIntoStudio={onLoadDecomposedIntoStudio}
+          onUnlockAudioSync={onUnlockAudioSync}
+          getSharedAudioContext={getSharedAudioContext}
+        />
+      ) : (
+        <>
+          {/* Hidden input for uploading Phone Audio Loop into Track 01 */}
+          <input
+            ref={phoneFileInputRef}
+            type="file"
+            accept="audio/*,video/mp4,.mp3,.wav,.m4a,.mp4,.aac,.ogg,.opus,.flac,.webm,.3gp,.amr"
+            className="hidden"
+            onChange={(e) => void handlePhoneLoopFileChange(e)}
+          />
+
+          {/* TOP FL-STUDIO PLAYLIST TOOLBAR */}
+          <section className="rounded-xl border border-[#2F3A47] bg-[#1A2027] px-3 py-2.5 sm:px-4">
         <div className="flex flex-wrap items-center justify-between gap-2.5">
           {/* Left: Arrangement Title + Key/Scale + Prev/Next History Arrows */}
           <div className="flex flex-wrap items-center gap-2">
@@ -2672,22 +2763,24 @@ export const StemBuilderStudio: React.FC<StemBuilderStudioProps> = ({
         </div>
       )}
 
-      {/* Voice & Dual-API Sound Browser Modal */}
-      <StemVoiceBrowserModal
-        isOpen={voiceBrowserTarget !== null}
-        targetChannel={voiceBrowserTarget}
-        freesoundKey={freesoundKey}
-        secondarySoundConfigured={secondarySoundConfigured}
-        secondarySoundProvider={secondarySoundProvider}
-        onSelectKeyboardVoice={onChannelSoundChange}
-        onSelectCustomSampleVoice={onChannelCustomSampleChange}
-        onAuditionKeyboardVoice={onAuditionKeyboardVoice}
-        onOpenFreesoundKeyModal={() => {
-          setVoiceBrowserChannelId(null);
-          onOpenFreesoundKeyModal();
-        }}
-        onClose={() => setVoiceBrowserChannelId(null)}
-      />
+          {/* Voice & Dual-API Sound Browser Modal */}
+          <StemVoiceBrowserModal
+            isOpen={voiceBrowserTarget !== null}
+            targetChannel={voiceBrowserTarget}
+            freesoundKey={freesoundKey}
+            secondarySoundConfigured={secondarySoundConfigured}
+            secondarySoundProvider={secondarySoundProvider}
+            onSelectKeyboardVoice={onChannelSoundChange}
+            onSelectCustomSampleVoice={onChannelCustomSampleChange}
+            onAuditionKeyboardVoice={onAuditionKeyboardVoice}
+            onOpenFreesoundKeyModal={() => {
+              setVoiceBrowserChannelId(null);
+              onOpenFreesoundKeyModal();
+            }}
+            onClose={() => setVoiceBrowserChannelId(null)}
+          />
+        </>
+      )}
     </div>
   );
 };

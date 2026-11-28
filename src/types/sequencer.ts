@@ -125,7 +125,9 @@ export type KeyboardSoundId =
   | 'synth_lead'
   | 'synth_brass'
   | 'warm_pad'
+  | 'strings'
   | 'worship_bass'
+  | 'sub_bass'
   | 'marimba_pluck'
   | 'choir_voice';
 
@@ -138,7 +140,7 @@ export type ScaleType = 'major' | 'minor' | 'pentatonic';
 export interface StemNote {
   step: number; // 0+ (supports extended multi-bar song timelines)
   midi: number; // 36..84
-  durationSteps: number; // 1..16
+  durationSteps: number; // 1..32
   velocity: number; // 1..100
   startOffsetSteps?: number; // -0.5..0.5 sub-step micro-timing offset
   exactDurationSteps?: number; // Exact duration in steps (preserves fast 30ms notes)
@@ -160,4 +162,110 @@ export interface StemChannel {
   pan: number;
   totalSteps?: number; // Bar-aligned timeline length (extends past 64 when singing longer phrases)
   notes: StemNote[];
+}
+
+export type StemSubPage = 'studio' | 'decomposer';
+
+export type SongSectionType =
+  | 'intro'
+  | 'verse'
+  | 'chorus'
+  | 'breakdown'
+  | 'bridge'
+  | 'outro';
+
+export interface BarAcousticMetric {
+  barIndex: number; // 0-based
+  rmsEnergy: number; // 0..1 normalized
+  lowBandEnergy: number; // 0..1 normalized
+  percussionTransientScore: number; // 0..1 normalized
+  spectralBrightness: number; // 0..1 normalized
+  spectralFluxDelta: number; // 0..1 normalized bar-to-bar change
+  hasPercussion: boolean;
+}
+
+export interface SongSectionSegment {
+  id: string;
+  type: SongSectionType;
+  label: string;
+  startBar: number; // 0-based inclusive
+  endBar: number; // 0-based exclusive (count = endBar - startBar)
+  hasPercussion: boolean;
+  grooveDensity: 'none' | 'light' | 'medium' | 'full';
+  avgEnergy: number;
+  spectralBrightness: number;
+}
+
+export type PercussionLoopPresetId =
+  | 'shaker_pulse'
+  | 'highlife_verse'
+  | 'afro_chorus_lift'
+  | 'bridge_groove';
+
+export interface Track1LoopClip {
+  id: string;
+  startBar: number;
+  endBar: number;
+  loopPresetId: PercussionLoopPresetId;
+  label: string;
+  sectionLabel: string;
+  intensity: number; // 0.35..1.0
+}
+
+export interface DecomposedInstrumentTrack {
+  trackNumber: number; // 2..19 (up to 18 channels)
+  id: string;
+  name: string;
+  presetLabel: string;
+  register: 'bass' | 'mid' | 'high';
+  soundId: KeyboardSoundId;
+  color: StemChannel['color'];
+  isActive: boolean;
+  activeBars: number[];
+  muted: boolean;
+  soloed: boolean;
+  volume_db: number;
+  pan: number;
+  notes: StemNote[];
+}
+
+export type TransitionFxType =
+  | 'riser'
+  | 'reverse_cymbal'
+  | 'sweep'
+  | 'sub_impact';
+
+export interface TransitionFxEvent {
+  id: string;
+  type: TransitionFxType;
+  label: string;
+  trackNumber: 20 | 21;
+  startBar: number;
+  durationBars: number;
+  triggerStep: number;
+  durationSteps: number;
+  intensity: number; // 0.4..1.0
+}
+
+export interface ReferenceDecompositionResult {
+  fileName: string;
+  durationSec: number;
+  bpm: number;
+  beatOffsetSec: number;
+  rootKey: 'C' | 'C#' | 'D' | 'Eb' | 'E' | 'F' | 'F#' | 'G' | 'Ab' | 'A' | 'Bb' | 'B';
+  scaleType: ScaleType;
+  keyConfidence: number;
+  totalBars: number;
+  totalSteps: number;
+  barMetrics: BarAcousticMetric[];
+  sections: SongSectionSegment[];
+  track1Clips: Track1LoopClip[];
+  track1Muted: boolean;
+  track1Soloed: boolean;
+  track1VolumeDb: number;
+  instrumentTracks: DecomposedInstrumentTrack[]; // 18 channels (Tracks 02..19)
+  transitionFxEvents: TransitionFxEvent[]; // Tracks 20..21
+  fxMuted: boolean;
+  fxSoloed: boolean;
+  fxVolumeDb: number;
 }

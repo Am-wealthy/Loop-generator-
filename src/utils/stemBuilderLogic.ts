@@ -58,10 +58,24 @@ export const KEYBOARD_SOUND_PRESETS: KeyboardSoundPreset[] = [
     defaultOctave: 4,
   },
   {
+    id: 'strings',
+    label: 'Lush Strings Ensemble',
+    shortLabel: 'Strings',
+    role: 'Orchestral Swells',
+    defaultOctave: 4,
+  },
+  {
     id: 'worship_bass',
     label: 'Fretless Worship Bass',
     shortLabel: 'Worship Bass',
     role: 'Low End',
+    defaultOctave: 2,
+  },
+  {
+    id: 'sub_bass',
+    label: 'Deep Sub Bass',
+    shortLabel: 'Sub Bass',
+    role: 'Deep 808 / Sub',
     defaultOctave: 2,
   },
   {
